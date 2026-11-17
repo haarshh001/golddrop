@@ -1,0 +1,15 @@
+{
+  "name": "gold-rewards-capture",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "capture": "node capture.mjs",
+    "smoke": "node capture.mjs --smoke",
+    "check": "node gold_checker.mjs",
+    "check:dry": "node gold_checker.mjs --dry-run"
+  },
+  "dependencies": {
+    "playwright": "1.64.1"
+  }
+}
