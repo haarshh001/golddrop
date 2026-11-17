@@ -84,6 +84,28 @@ TOKEN_BUDGET = int(os.environ.get("TOKEN_BUDGET", "2000") or ENV_VALUES.get("TOK
 TOKENS_USED = 0
 TOKEN_LOCK = threading.Lock()
 
+# ─── Solver selection ───────────────────────────────────────────────────────
+# SOLVER_MODE: auto (default) | sursolver | 2captcha.
+# In auto / sursolver mode, a pool of SurSolver keys is rotated round-robin.
+# A key whose daily quota is exhausted is marked for the UTC day and skipped.
+# When no SurSolver key is usable, auto mode falls back to 2captcha.
+SOLVER_MODE = (os.environ.get("SOLVER_MODE", "").strip().lower()
+               or ENV_VALUES.get("SOLVER_MODE", "").strip().lower() or "auto")
+SURSOLVER_CREATE_URL = "https://api.sursolver.com/createTask"
+SURSOLVER_RESULT_URL = "https://api.sursolver.com/getTaskResult"
+# SurSolver requires one of its supported user agents; a token must be replayed
+# with the same UA. This Chrome 148 value is from their documented list and was
+# verified live against the Gold Drop register endpoint.
+SURSOLVER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
+SURSOLVER_POLL_SECONDS = 3
+SURSOLVER_MAX_POLLS = 40            # ~120 s, within their 180 s execution budget
+SURSOLVER_WAIT_SECONDS = 30         # max wait for a key's single thread to free
+SURSOLVER_KEY_STATE = {}            # key -> {"exhausted_day": ..., "lock": Lock}
+SURSOLVER_CURSOR = 0
+SURSOLVER_POOL_LOCK = threading.Lock()
+SURSOLVER_USED = 0
+
 
 # ─── Configuration ──────────────────────────────────────────────────────────
 
@@ -458,8 +480,152 @@ def get_proxy():
     return load_settings().get("proxy", "")
 
 
-def solve_turnstile():
-    """Solve one Turnstile token via 2captcha. Tokens are single-use."""
+def get_solver_mode():
+    """Live-overridable solver mode: settings.json wins for dashboard edits."""
+    try:
+        value = str(load_settings().get("solver_mode", "")).strip().lower()
+    except Exception:
+        value = ""
+    return value or SOLVER_MODE or "auto"
+
+
+def get_sursolver_keys():
+    """Parse the SurSolver key pool from env or settings.json."""
+    raw = (os.environ.get("SURSOLVER_KEYS", "").strip()
+           or ENV_VALUES.get("SURSOLVER_KEYS", "").strip())
+    keys = []
+    if raw:
+        keys = [k.strip() for k in re.split(r"[,\s]+", raw) if k.strip()]
+    if not keys:
+        try:
+            saved = load_settings().get("sursolver_keys", "")
+        except Exception:
+            saved = ""
+        if isinstance(saved, list):
+            keys = [str(k).strip() for k in saved if str(k).strip()]
+        elif isinstance(saved, str):
+            keys = [k.strip() for k in re.split(r"[,\s]+", saved) if k.strip()]
+    # de-duplicate, preserve order
+    seen = set()
+    return [k for k in keys if not (k in seen or seen.add(k))]
+
+
+def key_label(key):
+    """Never log a full solver key."""
+    text = str(key)
+    if len(text) <= 12:
+        return text[:4] + "..."
+    return text[:8] + "..." + text[-4:]
+
+
+def utc_day_key():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def sur_key_state(key):
+    """Return the per-key state, creating it on first use."""
+    with SURSOLVER_POOL_LOCK:
+        if key not in SURSOLVER_KEY_STATE:
+            SURSOLVER_KEY_STATE[key] = {"exhausted_day": None, "lock": threading.Lock()}
+        return SURSOLVER_KEY_STATE[key]
+
+
+def mark_sur_key_exhausted(key):
+    state = sur_key_state(key)
+    state["exhausted_day"] = utc_day_key()
+    log("SurSolver key %s exhausted for UTC day %s" % (key_label(key), utc_day_key()), "ERROR")
+
+
+def sur_key_usable(key):
+    return sur_key_state(key).get("exhausted_day") != utc_day_key()
+
+
+def solve_with_sursolver():
+    """Rotate through the SurSolver key pool, respecting 1 task per account.
+
+    Returns (token, user_agent) on success or None when no key can solve.
+    """
+    global SURSOLVER_CURSOR, SURSOLVER_USED
+    keys = get_sursolver_keys()
+    if not keys:
+        return None
+
+    deadline = time.time() + SURSOLVER_WAIT_SECONDS
+    first_round = True
+    while time.time() < deadline or first_round:
+        first_round = False
+        with SURSOLVER_POOL_LOCK:
+            start = SURSOLVER_CURSOR % len(keys)
+            order = keys[start:] + keys[:start]
+
+        for key in order:
+            if not sur_key_usable(key):
+                continue
+            state = sur_key_state(key)
+            if not state["lock"].acquire(blocking=False):
+                continue  # this account already has a task in flight
+            try:
+                created = requests.post(SURSOLVER_CREATE_URL, json={
+                    "clientKey": key,
+                    "task": {
+                        "type": "TurnstileTokenProxyLess",
+                        "websiteURL": TURNSTILE_URL,
+                        "websiteKey": TURNSTILE_SITEKEY,
+                        "userAgent": SURSOLVER_UA,
+                    },
+                }, timeout=20).json()
+                if created.get("errorId") != 0:
+                    code = created.get("errorCode")
+                    desc = created.get("errorDescription", "")
+                    if code == "ERROR_ZERO_BALANCE":
+                        mark_sur_key_exhausted(key)
+                    elif code == "ERROR_NO_SLOT_AVAILABLE":
+                        pass  # another task on this account; try next key
+                    else:
+                        log("SurSolver key %s create failed: %s %s"
+                            % (key_label(key), code, str(desc)[:120]), "ERROR")
+                    continue
+
+                task_id = created.get("taskId")
+                for _ in range(SURSOLVER_MAX_POLLS):
+                    time.sleep(SURSOLVER_POLL_SECONDS)
+                    result = requests.post(SURSOLVER_RESULT_URL, json={
+                        "clientKey": key, "taskId": task_id,
+                    }, timeout=20).json()
+                    if result.get("errorId") != 0:
+                        code = result.get("errorCode")
+                        if code == "ERROR_ZERO_BALANCE":
+                            mark_sur_key_exhausted(key)
+                        else:
+                            log("SurSolver key %s task error: %s"
+                                % (key_label(key), code), "ERROR")
+                        break
+                    if result.get("status") == "ready":
+                        token = (result.get("solution") or {}).get("token", "")
+                        if token:
+                            with SURSOLVER_POOL_LOCK:
+                                SURSOLVER_CURSOR = (keys.index(key) + 1) % len(keys)
+                                SURSOLVER_USED += 1
+                                used = SURSOLVER_USED
+                            log("SurSolver token solved via %s (used %d)"
+                                % (key_label(key), used))
+                            return token, SURSOLVER_UA
+                        break
+                    if result.get("status") not in ("processing", "idle"):
+                        break
+            except Exception as exc:
+                log("SurSolver key %s error: %s" % (key_label(key), exc), "ERROR")
+            finally:
+                state["lock"].release()
+
+        if not any(sur_key_usable(k) for k in keys):
+            break
+        time.sleep(1)
+    return None
+
+
+def solve_with_2captcha():
+    """Solve one Turnstile token via 2captcha. Returns (token, user_agent)."""
     global TOKENS_USED
     if not TWOCAPTCHA_KEY:
         raise RuntimeError("TWOCAPTCHA_KEY is not set in .env or environment")
@@ -510,10 +676,35 @@ def solve_turnstile():
             with TOKEN_LOCK:
                 TOKENS_USED += 1
                 used = TOKENS_USED
-            log("Turnstile token solved (cost %s, used %d/%d)"
+            log("2captcha token solved (cost %s, used %d/%d)"
                 % (result.get("cost", "?"), used, TOKEN_BUDGET))
-            return token
+            return token, UA  # 2captcha tokens are not bound to a specific UA
     raise RuntimeError("2captcha solve timed out")
+
+
+def solve_turnstile():
+    """Return (token, user_agent) using the configured solver(s).
+
+    auto      -> SurSolver pool first, 2captcha when no key can solve.
+    sursolver -> SurSolver pool only.
+    2captcha  -> 2captcha only.
+    """
+    mode = get_solver_mode()
+    if mode not in ("auto", "sursolver", "2captcha"):
+        log("Unknown SOLVER_MODE %r; using auto" % mode, "ERROR")
+        mode = "auto"
+
+    if mode in ("auto", "sursolver"):
+        result = solve_with_sursolver()
+        if result:
+            return result
+        if mode == "sursolver":
+            raise RuntimeError("SurSolver pool exhausted and SOLVER_MODE=sursolver")
+        log("SurSolver pool unavailable; falling back to 2captcha")
+
+    if not TWOCAPTCHA_KEY:
+        raise RuntimeError("TWOCAPTCHA_KEY is not set in .env or environment")
+    return solve_with_2captcha()
 
 
 def is_token_error(error):
@@ -636,8 +827,10 @@ def gold_get_start(session, user_key):
     return d
 
 
-def gold_register(session, user_key, data_key, phone, name, email, pincode, token=None):
+def gold_register(session, user_key, data_key, phone, name, email, pincode, token=None, ua=None):
     """Multipart register. Signature covers seven text fields incl. Turnstile token."""
+    if ua:
+        session.headers.update({"user-agent": ua})
     payload = {
         "name": name,
         "mobile": phone,
@@ -1005,8 +1198,8 @@ def run_gold_flow(phone, db_url, device_id, poll_otp_fn, proxies=None, baseline_
         log("  [%s] Registering: %s / %s / %s" % (phone, name, pincode, user_key))
 
         # One Turnstile token per registration attempt (single-use, fresh).
-        token = solve_turnstile()
-        gold_register(s, user_key, data_key, phone, name, email, pincode, token)
+        token, solver_ua = solve_turnstile()
+        gold_register(s, user_key, data_key, phone, name, email, pincode, token, ua=solver_ua)
         log("  [%s] OTP sent. Waiting for BigCity SMS..." % phone)
 
         otp = poll_otp_fn(BIGCITY_SMS_PATTERN, BIGCITY_OTP_TIMEOUT,
@@ -1360,11 +1553,12 @@ def test_token_flow(phone="8000958285"):
     proxies = {"http": proxy, "https": proxy} if proxy else None
     s, user_key, data_key = gold_create_session(proxies)
     gold_get_start(s, user_key)
-    token = solve_turnstile()
+    token, solver_ua = solve_turnstile()
     log("Testing register with token for %s" % phone)
     try:
         result = gold_register(s, user_key, data_key, phone,
-                               random_name(), random_email(), next_pincode(), token)
+                               random_name(), random_email(), next_pincode(), token,
+                               ua=solver_ua)
         log("REGISTER RESULT: %s" % json.dumps(result, ensure_ascii=False))
     except Exception as exc:
         text = str(exc)
@@ -1381,6 +1575,25 @@ def test_token_flow(phone="8000958285"):
 def dry_run():
     log("=== DRY RUN (no live site requests) ===")
     log("2captcha key: %s | budget: %d tokens" % ("set" if TWOCAPTCHA_KEY else "NOT SET", TOKEN_BUDGET))
+    log("Solver mode: %s | SurSolver keys: %d" % (get_solver_mode(), len(get_sursolver_keys())))
+
+    # Solver pool: rotation, exhaustion marker and key-label privacy.
+    old_state = dict(SURSOLVER_KEY_STATE)
+    fake_keys = ["sur_testaaaaaaaaaaaaaaaaaaaaaaaaaaaa1", "sur_testbbbbbbbbbbbbbbbbbbbbbbbbbb2"]
+    try:
+        with SURSOLVER_POOL_LOCK:
+            SURSOLVER_KEY_STATE.clear()
+            globals()["SURSOLVER_CURSOR"] = 0
+        assert sur_key_usable(fake_keys[0]), "fresh key should be usable"
+        mark_sur_key_exhausted(fake_keys[0])
+        assert not sur_key_usable(fake_keys[0]), "exhausted key should be skipped"
+        assert sur_key_usable(fake_keys[1]), "second key should remain usable"
+        assert "sur_" in key_label(fake_keys[0]) and len(key_label(fake_keys[0])) < len(fake_keys[0])
+    finally:
+        with SURSOLVER_POOL_LOCK:
+            SURSOLVER_KEY_STATE.clear()
+            SURSOLVER_KEY_STATE.update(old_state)
+    log("Solver pool: rotation/exhaustion/label privacy verified")
     links = load_firebase_links()
     assert links and len(links) > 0, "link.txt parsed to zero databases"
     log("link.txt: %d databases (first: %s)" % (len(links), links[0]))
@@ -1560,7 +1773,13 @@ def firebases_page():
 
 @app.route("/settings")
 def settings_page():
-    return render_template("settings.html", settings=load_settings())
+    settings = load_settings()
+    keys = settings.get("sursolver_keys", "")
+    if isinstance(keys, list):
+        settings["sursolver_keys"] = ", ".join(str(k) for k in keys)
+    elif not isinstance(keys, str):
+        settings["sursolver_keys"] = ""
+    return render_template("settings.html", settings=settings)
 
 
 @app.route("/api/instances", methods=["POST"])
@@ -1666,6 +1885,24 @@ def api_test_proxy():
             return jsonify({"status": "success", "ip": data.get("query"),
                             "country": data.get("country")})
         return jsonify({"status": "error", "message": "Invalid response from ip-api"})
+    except Exception as exc:
+        return jsonify({"status": "error", "message": str(exc)})
+
+
+@app.route("/api/test_solver", methods=["POST"])
+def api_test_solver():
+    """Solve one token through the currently saved solver configuration."""
+    try:
+        mode = get_solver_mode()
+        token, ua = solve_turnstile()
+        provider = "sursolver" if ua == SURSOLVER_UA else "2captcha"
+        return jsonify({
+            "status": "success",
+            "provider": provider,
+            "mode": mode,
+            "token_len": len(token),
+            "prefix": token[:8] + "...",
+        })
     except Exception as exc:
         return jsonify({"status": "error", "message": str(exc)})
 
