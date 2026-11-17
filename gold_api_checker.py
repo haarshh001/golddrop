@@ -24,6 +24,7 @@ import html
 import threading
 import signal
 import uuid
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -44,6 +45,44 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 def data_path(name):
     return os.path.join(DATA_DIR, name)
+
+
+ENV_FILE = data_path(".env")
+
+
+def load_env_file():
+    """Minimal .env reader — no extra dependency."""
+    values = {}
+    if os.path.exists(ENV_FILE):
+        try:
+            with open(ENV_FILE, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" not in line:
+                        # Accept a bare 2captcha key file (key only, no KEY= prefix).
+                        if re.fullmatch(r"[A-Za-z0-9]{20,}", line):
+                            values["TWOCAPTCHA_KEY"] = line
+                        continue
+                    key, value = line.split("=", 1)
+                    values[key.strip()] = value.strip().strip("\"'")
+        except Exception:
+            pass
+    return values
+
+
+ENV_VALUES = load_env_file()
+TWOCAPTCHA_KEY = (os.environ.get("TWOCAPTCHA_KEY", "").strip()
+                  or ENV_VALUES.get("TWOCAPTCHA_KEY", "").strip()
+                  or ENV_VALUES.get("KEY", "").strip())
+TURNSTILE_SITEKEY = "0x4AAAAAAGE1rl5Luu7yDEl0"
+TURNSTILE_URL = "https://golddropgolddhamaka.com/register"
+TWOCAPTCHA_CREATE_URL = "https://api.2captcha.com/createTask"
+TWOCAPTCHA_RESULT_URL = "https://api.2captcha.com/getTaskResult"
+TOKEN_BUDGET = int(os.environ.get("TOKEN_BUDGET", "2000") or ENV_VALUES.get("TOKEN_BUDGET", "2000"))
+TOKENS_USED = 0
+TOKEN_LOCK = threading.Lock()
 
 
 # ─── Configuration ──────────────────────────────────────────────────────────
@@ -67,8 +106,18 @@ ZOMATO_OTP_TIMEOUT = 12
 ZOMATO_POLL_INTERVAL = 3
 
 NUM_WORKERS = 3
-ATTEMPTS_PER_NUMBER = 5
+ATTEMPTS_PER_NUMBER = int(os.environ.get("ATTEMPTS_PER_NUMBER", "5")
+                         or ENV_VALUES.get("ATTEMPTS_PER_NUMBER", "5"))
 BATCH_CODE = "KKD2LS01261026"
+
+# Skip a device once it has this many BigCity messages dated today.
+BIGCITY_DAILY_LIMIT = int(os.environ.get("BIGCITY_DAILY_LIMIT", "5")
+                          or ENV_VALUES.get("BIGCITY_DAILY_LIMIT", "5"))
+
+# Persisted device marker: devices already used today ( IST date ). Written when
+# a number on the device returns the participation response, so restarts skip
+# them for the rest of that day. A new calendar date makes them eligible again.
+DEVICE_MARKS_FILE = data_path("device_day_marks.json")
 
 # Empty ipInfo is accepted by the live endpoint. If the server ever starts
 # enforcing geography, replace this with the Telangana ipInfo object from the
@@ -160,8 +209,21 @@ PINCODE_LOCK = threading.Lock()
 PINCODE_CURSOR = 0
 REJECTED_PINCODES = set()
 
+# In-memory optimisation state (no processed.txt / burned_phones.txt).
+USED_NUMBERS = set()        # numbers that returned participation this process
+USED_NUMBERS_LOCK = threading.Lock()
+CLAIMED_NUMBERS = set()     # numbers currently being worked by a worker
+CLAIMED_LOCK = threading.Lock()
+DEVICE_MARKS_LOCK = threading.Lock()
+
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36")
+
+
+def release_claim(phone):
+    with CLAIMED_LOCK:
+        CLAIMED_NUMBERS.discard(phone)
+
 
 # ─── Random Data ────────────────────────────────────────────────────────────
 
@@ -297,6 +359,52 @@ def load_hits():
         return []
 
 
+def today_key():
+    """IST calendar date as YYYY-MM-DD; the rollover point is 00:00 IST."""
+    return datetime.now(IST).strftime("%Y-%m-%d")
+
+
+def load_device_marks():
+    """Return {date: [device_id, ...]} from the volume."""
+    with DEVICE_MARKS_LOCK:
+        try:
+            if os.path.exists(DEVICE_MARKS_FILE):
+                with open(DEVICE_MARKS_FILE, "r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+    return {}
+
+
+def device_marked_today(device_id):
+    return str(device_id) in load_device_marks().get(today_key(), [])
+
+
+def mark_device_used_today(device_id):
+    """Persist a device under today's IST date. Older dates are pruned."""
+    with DEVICE_MARKS_LOCK:
+        try:
+            data = {}
+            if os.path.exists(DEVICE_MARKS_FILE):
+                with open(DEVICE_MARKS_FILE, "r", encoding="utf-8") as handle:
+                    loaded = json.load(handle)
+                if isinstance(loaded, dict):
+                    data = loaded
+            key = today_key()
+            devices = data.setdefault(key, [])
+            if str(device_id) not in devices:
+                devices.append(str(device_id))
+            # keep only the last 7 calendar dates
+            for old in sorted(data.keys())[:-7]:
+                data.pop(old, None)
+            with open(DEVICE_MARKS_FILE, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2)
+        except Exception as exc:
+            log("device mark save error: %s" % exc, "ERROR")
+
+
 def attach_reward_sms(hit, text, msg_key):
     """Persist the SMS code into the saved hit before deleting the source message."""
     if not hit:
@@ -348,6 +456,69 @@ def get_proxy():
         if value:
             return value
     return load_settings().get("proxy", "")
+
+
+def solve_turnstile():
+    """Solve one Turnstile token via 2captcha. Tokens are single-use."""
+    global TOKENS_USED
+    if not TWOCAPTCHA_KEY:
+        raise RuntimeError("TWOCAPTCHA_KEY is not set in .env or environment")
+    with TOKEN_LOCK:
+        if TOKENS_USED >= TOKEN_BUDGET:
+            raise RuntimeError("2captcha token budget exhausted: %d" % TOKEN_BUDGET)
+
+    task = {
+        "type": "TurnstileTaskProxyless",
+        "websiteURL": TURNSTILE_URL,
+        "websiteKey": TURNSTILE_SITEKEY,
+    }
+    proxy = get_proxy()
+    if proxy:
+        parsed = urllib.parse.urlparse(proxy)
+        task = {
+            "type": "TurnstileTask",
+            "websiteURL": TURNSTILE_URL,
+            "websiteKey": TURNSTILE_SITEKEY,
+            "proxyType": "http",
+            "proxyAddress": parsed.hostname or "",
+            "proxyPort": parsed.port or 80,
+        }
+        if parsed.username:
+            task["proxyLogin"] = urllib.parse.unquote(parsed.username)
+        if parsed.password:
+            task["proxyPassword"] = urllib.parse.unquote(parsed.password)
+
+    created = requests.post(TWOCAPTCHA_CREATE_URL, json={
+        "clientKey": TWOCAPTCHA_KEY, "task": task,
+    }, timeout=20).json()
+    if created.get("errorId") != 0:
+        raise RuntimeError("2captcha createTask failed: %s" % created.get("errorDescription", created))
+
+    task_id = created.get("taskId")
+    for _ in range(40):
+        time.sleep(3)
+        result = requests.post(TWOCAPTCHA_RESULT_URL, json={
+            "clientKey": TWOCAPTCHA_KEY, "taskId": task_id,
+        }, timeout=20).json()
+        if result.get("errorId") != 0:
+            raise RuntimeError("2captcha getTaskResult failed: %s"
+                               % result.get("errorDescription", result))
+        if result.get("status") == "ready":
+            token = (result.get("solution") or {}).get("token", "")
+            if not token:
+                raise RuntimeError("2captcha returned no token")
+            with TOKEN_LOCK:
+                TOKENS_USED += 1
+                used = TOKENS_USED
+            log("Turnstile token solved (cost %s, used %d/%d)"
+                % (result.get("cost", "?"), used, TOKEN_BUDGET))
+            return token
+    raise RuntimeError("2captcha solve timed out")
+
+
+def is_token_error(error):
+    text = str(error).lower()
+    return "messageid': 'token'" in text or "messageid: token" in text or "security check" in text
 
 
 def save_settings(settings):
@@ -465,8 +636,8 @@ def gold_get_start(session, user_key):
     return d
 
 
-def gold_register(session, user_key, data_key, phone, name, email, pincode):
-    """Multipart register. Signature covers six text fields; img is appended unsigned."""
+def gold_register(session, user_key, data_key, phone, name, email, pincode, token=None):
+    """Multipart register. Signature covers seven text fields incl. Turnstile token."""
     payload = {
         "name": name,
         "mobile": phone,
@@ -475,6 +646,7 @@ def gold_register(session, user_key, data_key, phone, name, email, pincode):
         "code": BATCH_CODE,
         "terms_accepted": "1",
         "userKey": str(user_key),
+        "token": token or "",
     }
     ts, data_field = gold_sign(payload, data_key)
     r = session.post(
@@ -632,6 +804,19 @@ def parse_message_date(msg, key):
         return datetime.fromtimestamp(int(key) / 1000.0, IST).date()
     except Exception:
         return None
+
+
+def bigcity_count_today(db_url, device_id):
+    """Count BigCity messages dated today (IST). Evaluated at device visit, so
+    the count resets automatically when the calendar date rolls over at 00:00."""
+    today = datetime.now(IST).date()
+    count = 0
+    for key, msg in fetch_messages(db_url, device_id).items():
+        if not isinstance(msg, dict) or not is_bigcity_message(msg):
+            continue
+        if parse_message_date(msg, key) == today:
+            count += 1
+    return count
 
 
 def extract_phone_from_device(device_data):
@@ -819,7 +1004,9 @@ def run_gold_flow(phone, db_url, device_id, poll_otp_fn, proxies=None, baseline_
         pincode = next_pincode()
         log("  [%s] Registering: %s / %s / %s" % (phone, name, pincode, user_key))
 
-        gold_register(s, user_key, data_key, phone, name, email, pincode)
+        # One Turnstile token per registration attempt (single-use, fresh).
+        token = solve_turnstile()
+        gold_register(s, user_key, data_key, phone, name, email, pincode, token)
         log("  [%s] OTP sent. Waiting for BigCity SMS..." % phone)
 
         otp = poll_otp_fn(BIGCITY_SMS_PATTERN, BIGCITY_OTP_TIMEOUT,
@@ -978,6 +1165,12 @@ def firebase_worker(instance_id, start_idx, end_idx):
 
     while RUNNING_FLAGS.get(instance_id, False):
         try:
+            with TOKEN_LOCK:
+                used_now, budget = TOKENS_USED, TOKEN_BUDGET
+            log("[*] Inst %s token budget: %d/%d used (~$%.3f spent, ~$%.3f left)"
+                % (instance_id, used_now, budget, used_now * 0.00145,
+                   max(0, budget - used_now) * 0.00145))
+
             # Reload each cycle so a proxy saved in the dashboard takes effect.
             # A Railway env var overrides the file when one is configured.
             proxy = get_proxy()
@@ -1012,6 +1205,17 @@ def firebase_worker(instance_id, start_idx, end_idx):
                     if not device_data.get("status"):
                         continue
 
+                    # Device-level skips, evaluated with today's IST date at visit.
+                    bigcity_today = bigcity_count_today(db_url, device_id)
+                    if bigcity_today >= BIGCITY_DAILY_LIMIT:
+                        log("  [%s] %d BigCity SMS dated today - skipping device"
+                            % (device_id[:12], bigcity_today))
+                        continue
+                    if device_marked_today(device_id):
+                        log("  [%s] Already used today (marker) - skipping device"
+                            % device_id[:12])
+                        continue
+
                     numbers = []
                     primary = extract_phone_from_device(device_data)
                     if primary:
@@ -1025,6 +1229,14 @@ def firebase_worker(instance_id, start_idx, end_idx):
                     for phone in numbers:
                         if not RUNNING_FLAGS.get(instance_id, False):
                             break
+                        if phone in USED_NUMBERS:
+                            log("    [~] Already used today (cache), skipping: %s" % phone)
+                            continue
+                        with CLAIMED_LOCK:
+                            if phone in CLAIMED_NUMBERS:
+                                log("    [~] Claimed by another instance, skipping: %s" % phone)
+                                continue
+                            CLAIMED_NUMBERS.add(phone)
 
                         # Capture the inbox watermark before triggering Zomato.
                         zomato_baseline = get_last_message_key(db_url, device_id)
@@ -1037,14 +1249,17 @@ def firebase_worker(instance_id, start_idx, end_idx):
                             log("    [-] Zomato rejected/errored; trying Instamart fallback")
                             if not instamart_send_otp(phone, proxies=proxy_dict):
                                 log("    [-] Instamart fallback also failed")
+                                release_claim(phone)
                                 continue
                             if not poll_for_instamart_otp(db_url, device_id,
                                                           last_key=zomato_baseline):
                                 log("    [-] Instamart OTP not received on device")
+                                release_claim(phone)
                                 continue
                         elif not poll_for_zomato_otp(db_url, device_id,
                                                      last_key=zomato_baseline):
                             log("    [-] Zomato OTP not received on device; skipping")
+                            release_claim(phone)
                             continue
 
                         log("    [+] Active number confirmed. Starting Gold Drop flow.")
@@ -1089,8 +1304,10 @@ def firebase_worker(instance_id, start_idx, end_idx):
                                     reject_pincode(bad_pin)
                                     log("    [!] Pincode %s rejected by server; removed from pool"
                                         % bad_pin, "ERROR")
+                                token_error = is_token_error(error)
                                 routine = (
                                     pincode_error
+                                    or token_error
                                     or is_connection_error(error)
                                     or any(kw in error_lower for kw in (
                                         "otp not received in time",
@@ -1102,7 +1319,14 @@ def firebase_worker(instance_id, start_idx, end_idx):
                                     ))
                                 )
                                 if already:
-                                    log("    [~] Number already used today, skipping: %s" % phone)
+                                    with USED_NUMBERS_LOCK:
+                                        USED_NUMBERS.add(phone)
+                                    mark_device_used_today(device_id)
+                                    log("    [~] Number already used today, skipping: %s | device marked for today" % phone)
+                                    break  # stop attempts for this number only; other numbers continue
+                                if token_error:
+                                    # Never burn the remaining tokens on a rejected token.
+                                    log("    [~] Turnstile token rejected; stopping this number", "ERROR")
                                     break
                                 if routine:
                                     log("    [!] %s" % error, "ERROR")
@@ -1116,6 +1340,8 @@ def firebase_worker(instance_id, start_idx, end_idx):
                                         % (phone, html.escape(error), html.escape(device_id))
                                     )
 
+                        release_claim(phone)
+
             log("[+] Inst %s cycle complete. Restarting in 10s..." % instance_id)
             time.sleep(10)
         except Exception as exc:
@@ -1128,8 +1354,33 @@ def firebase_worker(instance_id, start_idx, end_idx):
 
 # ─── Dry Run ────────────────────────────────────────────────────────────────
 
+def test_token_flow(phone="8000958285"):
+    """One real solve + one register against an already-used number (no SMS)."""
+    proxy = get_proxy()
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    s, user_key, data_key = gold_create_session(proxies)
+    gold_get_start(s, user_key)
+    token = solve_turnstile()
+    log("Testing register with token for %s" % phone)
+    try:
+        result = gold_register(s, user_key, data_key, phone,
+                               random_name(), random_email(), next_pincode(), token)
+        log("REGISTER RESULT: %s" % json.dumps(result, ensure_ascii=False))
+    except Exception as exc:
+        text = str(exc)
+        if is_token_error(text):
+            log("TOKEN REJECTED: %s" % text, "ERROR")
+        elif is_used_today_error(text):
+            log("TOKEN ACCEPTED (server reached participation check): %s" % text, "HIT")
+        else:
+            log("REGISTER ERROR: %s" % text, "ERROR")
+    finally:
+        s.close()
+
+
 def dry_run():
     log("=== DRY RUN (no live site requests) ===")
+    log("2captcha key: %s | budget: %d tokens" % ("set" if TWOCAPTCHA_KEY else "NOT SET", TOKEN_BUDGET))
     links = load_firebase_links()
     assert links and len(links) > 0, "link.txt parsed to zero databases"
     log("link.txt: %d databases (first: %s)" % (len(links), links[0]))
@@ -1175,6 +1426,64 @@ def dry_run():
     assert is_used_today_error(used_error), "participation error not classified as used-today"
     assert not is_used_today_error("BigCity OTP not received in time")
     log("Used-today detection: participation error matched, routine OTP error not matched")
+
+    # Device day-marker: date key, today-only skip, midnight rollover.
+    assert re.match(r"^\d{4}-\d{2}-\d{2}$", today_key()), "today_key format wrong"
+    import tempfile
+    old_marks = DEVICE_MARKS_FILE
+    tmp_dir = tempfile.mkdtemp(prefix="gd-marks-")
+    try:
+        globals()["DEVICE_MARKS_FILE"] = os.path.join(tmp_dir, "device_day_marks.json")
+        assert not device_marked_today("dry-device"), "fresh device should not be marked"
+        mark_device_used_today("dry-device")
+        assert device_marked_today("dry-device"), "device not marked after participation"
+        data = load_device_marks()
+        assert today_key() in data and "dry-device" in data[today_key()]
+        # simulate next calendar date: marker for today must not apply tomorrow
+        tomorrow = (datetime.now(IST) + timedelta(days=1)).strftime("%Y-%m-%d")
+        assert "dry-device" not in data.get(tomorrow, []), "marker leaked into tomorrow"
+    finally:
+        globals()["DEVICE_MARKS_FILE"] = old_marks
+        try:
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+    log("Device marker: today-only, rollover to next date verified")
+
+    # BigCity daily count uses only messages dated today.
+    today = datetime.now(IST).strftime("%d-%m-%Y")
+    old_fetch = globals()["fetch_messages"]
+    try:
+        globals()["fetch_messages"] = lambda *a, **k: {
+            "1": {"sender": "VK-BGCITY-T", "dateTime": "%s | 01:00 am" % today, "message": "OTP 123456 Team BigCity"},
+            "2": {"sender": "VK-BGCITY-T", "dateTime": "01-01-2020 | 01:00 am", "message": "OTP 654321 Team BigCity"},
+        }
+        assert bigcity_count_today("db", "dev") == 1, "old BigCity SMS counted toward today"
+    finally:
+        globals()["fetch_messages"] = old_fetch
+    log("BigCity daily count: only today's messages counted")
+
+    # Claim / used-number cache helpers.
+    old_claimed = set(CLAIMED_NUMBERS)
+    old_used = set(USED_NUMBERS)
+    try:
+        with CLAIMED_LOCK:
+            CLAIMED_NUMBERS.clear()
+        with USED_NUMBERS_LOCK:
+            USED_NUMBERS.clear()
+        with CLAIMED_LOCK:
+            CLAIMED_NUMBERS.add("dry-phone")
+        release_claim("dry-phone")
+        assert "dry-phone" not in CLAIMED_NUMBERS, "claim not released"
+    finally:
+        with CLAIMED_LOCK:
+            CLAIMED_NUMBERS.clear()
+            CLAIMED_NUMBERS.update(old_claimed)
+        with USED_NUMBERS_LOCK:
+            USED_NUMBERS.clear()
+            USED_NUMBERS.update(old_used)
+    log("Claim/used caches: claim release verified")
 
     proxy_error = ("HTTPSConnectionPool(host='golddropgolddhamaka.com', port=443): "
                    "Max retries exceeded with url: /api/users (Caused by ProxyError("
@@ -1427,6 +1736,12 @@ if __name__ == "__main__":
     os.makedirs("templates", exist_ok=True)
     if "--dry-run" in sys.argv:
         dry_run()
+    elif "--test-token" in sys.argv:
+        phone = "8000958285"
+        for arg in sys.argv:
+            if arg.startswith("--phone="):
+                phone = arg.split("=", 1)[1]
+        test_token_flow(phone)
     else:
         port = int(os.environ.get("PORT", "5003"))
         log("Gold Drop checker starting on port %d" % port)
