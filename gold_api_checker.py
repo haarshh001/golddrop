@@ -76,6 +76,8 @@ ENV_VALUES = load_env_file()
 TWOCAPTCHA_KEY = (os.environ.get("TWOCAPTCHA_KEY", "").strip()
                   or ENV_VALUES.get("TWOCAPTCHA_KEY", "").strip()
                   or ENV_VALUES.get("KEY", "").strip())
+NOCAPTCHA_KEY = (os.environ.get("NOCAPTCHA_KEY", "").strip()
+                 or ENV_VALUES.get("NOCAPTCHA_KEY", "").strip())
 TURNSTILE_SITEKEY = "0x4AAAAAAGE1rl5Luu7yDEl0"
 TURNSTILE_URL = "https://golddropgolddhamaka.com/register"
 TWOCAPTCHA_CREATE_URL = "https://api.2captcha.com/createTask"
@@ -85,12 +87,18 @@ TOKENS_USED = 0
 TOKEN_LOCK = threading.Lock()
 
 # ─── Solver selection ───────────────────────────────────────────────────────
-# SOLVER_MODE: auto (default) | sursolver | 2captcha.
-# In auto / sursolver mode, a pool of SurSolver keys is rotated round-robin.
-# A key whose daily quota is exhausted is marked for the UTC day and skipped.
-# When no SurSolver key is usable, auto mode falls back to 2captcha.
+# SOLVER_MODE: auto (default) | nocaptcha | sursolver | 2captcha.
+# auto chain: NoCaptchaAI -> SurSolver pool -> 2captcha.
+# NoCaptchaAI has a 6,000 solves/day plan and is tried first. Any error falls
+# through to SurSolver, and SurSolver exhaustion falls through to 2captcha.
 SOLVER_MODE = (os.environ.get("SOLVER_MODE", "").strip().lower()
                or ENV_VALUES.get("SOLVER_MODE", "").strip().lower() or "auto")
+NOCAPTCHA_CREATE_URL = "https://api.nocaptchaai.com/createTask"
+NOCAPTCHA_RESULT_URL = "https://api.nocaptchaai.com/getTaskResult"
+NOCAPTCHA_BALANCE_URL = "https://api.nocaptchaai.com/balance"
+NOCAPTCHA_POLL_SECONDS = 2
+NOCAPTCHA_MAX_POLLS = 60            # ~120 s
+NOCAPTCHA_USED = 0
 SURSOLVER_CREATE_URL = "https://api.sursolver.com/createTask"
 SURSOLVER_RESULT_URL = "https://api.sursolver.com/getTaskResult"
 # SurSolver requires one of its supported user agents; a token must be replayed
@@ -105,6 +113,7 @@ SURSOLVER_KEY_STATE = {}            # key -> {"exhausted_day": ..., "lock": Lock
 SURSOLVER_CURSOR = 0
 SURSOLVER_POOL_LOCK = threading.Lock()
 SURSOLVER_USED = 0
+LAST_SOLVER_PROVIDER = None
 
 
 # ─── Configuration ──────────────────────────────────────────────────────────
@@ -124,8 +133,16 @@ BIGCITY_SMS_PATTERN = "BGCITY"
 BIGCITY_OTP_TIMEOUT = 65
 BIGCITY_POLL_INTERVAL = 3
 
-ZOMATO_OTP_TIMEOUT = 12
+ZOMATO_OTP_TIMEOUT = 20
 ZOMATO_POLL_INTERVAL = 3
+
+# Transport failures (proxy tunnel timeout, connection reset, etc.) are retried
+# in place without consuming one of the 5 attempts — but only before a solver
+# token has been bought. A network failure after the token stage counts as a
+# normal attempt so we never pay for a second token on the same attempt.
+NETWORK_RETRIES = int(os.environ.get("NETWORK_RETRIES", "3")
+                      or ENV_VALUES.get("NETWORK_RETRIES", "3"))
+NETWORK_BACKOFF = (2, 4, 8)
 
 NUM_WORKERS = 3
 ATTEMPTS_PER_NUMBER = int(os.environ.get("ATTEMPTS_PER_NUMBER", "5")
@@ -140,6 +157,52 @@ BIGCITY_DAILY_LIMIT = int(os.environ.get("BIGCITY_DAILY_LIMIT", "5")
 # a number on the device returns the participation response, so restarts skip
 # them for the rest of that day. A new calendar date makes them eligible again.
 DEVICE_MARKS_FILE = data_path("device_day_marks.json")
+REJECTED_PINCODES_FILE = data_path("rejected_pincodes.json")
+
+# Default values for every dashboard-editable setting, grouped by section.
+# The Settings page reads these and /api/settings/reset restores one section.
+DEFAULTS = {
+    # proxy
+    "proxy": "",
+    # solver
+    "solver_mode": "auto",
+    "nocaptcha_key": "",
+    "sursolver_keys": [],
+    "twocaptcha_key": "",
+    "token_budget": 2000,
+    "network_retries": 3,
+    # device / campaign
+    "bigcity_daily_limit": 5,
+    "bigcity_sms_pattern": "BGCITY",
+    "mark_devices": True,
+    "attempts_per_number": 5,
+    # liveness
+    "zomato_enabled": True,
+    "instamart_fallback": True,
+    "zomato_otp_timeout": 20,
+    "zomato_poll_interval": 3,
+    "instamart_otp_timeout": 20,
+    "instamart_poll_interval": 3,
+    "bigcity_otp_timeout": 65,
+    "bigcity_poll_interval": 3,
+    # reward / telegram
+    "reward_watch_seconds": 90,
+    "delete_reward_sms": True,
+    "tg_bot_token": TG_BOT_TOKEN,
+    "tg_chat_id": TG_CHAT_ID,
+}
+SECTIONS = {
+    "proxy": ["proxy"],
+    "solver": ["solver_mode", "nocaptcha_key", "sursolver_keys", "twocaptcha_key",
+               "token_budget", "network_retries"],
+    "device": ["bigcity_daily_limit", "bigcity_sms_pattern", "mark_devices",
+               "attempts_per_number"],
+    "liveness": ["zomato_enabled", "instamart_fallback", "zomato_otp_timeout",
+                 "zomato_poll_interval", "instamart_otp_timeout",
+                 "instamart_poll_interval", "bigcity_otp_timeout",
+                 "bigcity_poll_interval"],
+    "reward": ["reward_watch_seconds", "delete_reward_sms", "tg_bot_token", "tg_chat_id"],
+}
 
 # Empty ipInfo is accepted by the live endpoint. If the server ever starts
 # enforcing geography, replace this with the Telangana ipInfo object from the
@@ -267,15 +330,56 @@ def random_email():
     return "%s@%s" % (local, random.choice(EMAIL_DOMAINS))
 
 
+def load_rejected_pincodes():
+    """Restore the persistent pincode blacklist at startup."""
+    global REJECTED_PINCODES
+    try:
+        if os.path.exists(REJECTED_PINCODES_FILE):
+            with open(REJECTED_PINCODES_FILE, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if isinstance(data, list):
+                with PINCODE_LOCK:
+                    REJECTED_PINCODES = set(int(str(p)) for p in data
+                                            if str(p).strip().isdigit())
+    except Exception as exc:
+        log("rejected pincodes load error: %s" % exc, "ERROR")
+
+
+def save_rejected_pincodes():
+    with open(REJECTED_PINCODES_FILE, "w", encoding="utf-8") as handle:
+        json.dump(sorted(REJECTED_PINCODES), handle)
+
+
 def reject_pincode(pincode):
-    """Drop a pincode the server rejected. In-memory only, no state file."""
+    """Drop a pincode the server rejected, persisting it across restarts."""
     if pincode is None:
         return
     try:
-        with PINCODE_LOCK:
-            REJECTED_PINCODES.add(int(str(pincode).strip()))
+        value = int(str(pincode).strip())
     except (TypeError, ValueError):
-        pass
+        return
+    with PINCODE_LOCK:
+        if value in REJECTED_PINCODES:
+            return
+        REJECTED_PINCODES.add(value)
+        try:
+            save_rejected_pincodes()
+        except Exception as exc:
+            log("rejected pincodes save error: %s" % exc, "ERROR")
+
+
+def reset_rejected_pincodes():
+    """Clear the persistent blacklist from the dashboard."""
+    global REJECTED_PINCODES
+    with PINCODE_LOCK:
+        REJECTED_PINCODES = set()
+        try:
+            save_rejected_pincodes()
+        except Exception as exc:
+            log("rejected pincodes reset error: %s" % exc, "ERROR")
+
+
+load_rejected_pincodes()
 
 
 def next_pincode():
@@ -321,9 +425,9 @@ def log(msg, level="INFO"):
 def send_telegram_alert(message):
     """Send a Telegram alert. Returns True only if Telegram confirmed delivery."""
     try:
-        url = "https://api.telegram.org/bot%s/sendMessage" % TG_BOT_TOKEN
+        url = "https://api.telegram.org/bot%s/sendMessage" % get_setting("tg_bot_token", str)
         r = requests.post(url, json={
-            "chat_id": TG_CHAT_ID,
+            "chat_id": get_setting("tg_chat_id", str),
             "text": message[:4000],
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
@@ -510,6 +614,34 @@ def get_sursolver_keys():
     return [k for k in keys if not (k in seen or seen.add(k))]
 
 
+def get_setting(key, cast=None):
+    """Read a setting live from settings.json, falling back to DEFAULTS."""
+    value = load_settings().get(key, DEFAULTS.get(key))
+    if value is None:
+        value = DEFAULTS.get(key)
+    if cast is int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return int(DEFAULTS.get(key, 0))
+    if cast is bool:
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in ("1", "true", "yes", "on")
+    if cast is list:
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            return [k.strip() for k in re.split(r"[,\s]+", value) if k.strip()]
+        return list(DEFAULTS.get(key, []))
+    return value
+
+
+def get_nocaptcha_key():
+    return (NOCAPTCHA_KEY or str(get_setting("nocaptcha_key", "")).strip()
+            or str(DEFAULTS["nocaptcha_key"]).strip())
+
+
 def key_label(key):
     """Never log a full solver key."""
     text = str(key)
@@ -540,12 +672,58 @@ def sur_key_usable(key):
     return sur_key_state(key).get("exhausted_day") != utc_day_key()
 
 
+def solve_with_nocaptcha():
+    """Solve one token via NoCaptchaAI. Returns (token, ua) or None on any error."""
+    global NOCAPTCHA_USED, LAST_SOLVER_PROVIDER
+    key = get_nocaptcha_key()
+    if not key:
+        return None
+    try:
+        created = requests.post(NOCAPTCHA_CREATE_URL, json={
+            "clientKey": key,
+            "task": {
+                "type": "AntiTurnstileTask",
+                "websiteURL": TURNSTILE_URL,
+                "websiteKey": TURNSTILE_SITEKEY,
+            },
+        }, timeout=20).json()
+        if created.get("errorId") not in (0, None) or not created.get("taskId"):
+            log("NoCaptchaAI create failed (key %s): %s"
+                % (key_label(key), str(created)[:200]), "ERROR")
+            return None
+        task_id = created.get("taskId")
+        for _ in range(NOCAPTCHA_MAX_POLLS):
+            time.sleep(NOCAPTCHA_POLL_SECONDS)
+            result = requests.post(NOCAPTCHA_RESULT_URL, json={
+                "clientKey": key, "taskId": task_id,
+            }, timeout=20).json()
+            if result.get("errorId") not in (0, None):
+                log("NoCaptchaAI task error (key %s): %s"
+                    % (key_label(key), str(result)[:200]), "ERROR")
+                return None
+            if result.get("status") == "ready":
+                token = (result.get("solution") or {}).get("token", "")
+                if token:
+                    NOCAPTCHA_USED += 1
+                    LAST_SOLVER_PROVIDER = "nocaptcha"
+                    log("NoCaptchaAI token solved via %s (used %d)"
+                        % (key_label(key), NOCAPTCHA_USED))
+                    return token, UA  # not bound to a special UA
+                return None
+            if result.get("status") not in ("processing", "idle"):
+                log("NoCaptchaAI unexpected status: %s" % result.get("status"), "ERROR")
+                return None
+    except Exception as exc:
+        log("NoCaptchaAI error (key %s): %s" % (key_label(key), exc), "ERROR")
+    return None
+
+
 def solve_with_sursolver():
     """Rotate through the SurSolver key pool, respecting 1 task per account.
 
     Returns (token, user_agent) on success or None when no key can solve.
     """
-    global SURSOLVER_CURSOR, SURSOLVER_USED
+    global SURSOLVER_CURSOR, SURSOLVER_USED, LAST_SOLVER_PROVIDER
     keys = get_sursolver_keys()
     if not keys:
         return None
@@ -607,6 +785,7 @@ def solve_with_sursolver():
                                 SURSOLVER_CURSOR = (keys.index(key) + 1) % len(keys)
                                 SURSOLVER_USED += 1
                                 used = SURSOLVER_USED
+                            LAST_SOLVER_PROVIDER = "sursolver"
                             log("SurSolver token solved via %s (used %d)"
                                 % (key_label(key), used))
                             return token, SURSOLVER_UA
@@ -630,8 +809,9 @@ def solve_with_2captcha():
     if not TWOCAPTCHA_KEY:
         raise RuntimeError("TWOCAPTCHA_KEY is not set in .env or environment")
     with TOKEN_LOCK:
-        if TOKENS_USED >= TOKEN_BUDGET:
-            raise RuntimeError("2captcha token budget exhausted: %d" % TOKEN_BUDGET)
+        if TOKENS_USED >= get_setting("token_budget", int):
+            raise RuntimeError("2captcha token budget exhausted: %d"
+                               % get_setting("token_budget", int))
 
     task = {
         "type": "TurnstileTaskProxyless",
@@ -676,8 +856,9 @@ def solve_with_2captcha():
             with TOKEN_LOCK:
                 TOKENS_USED += 1
                 used = TOKENS_USED
+            LAST_SOLVER_PROVIDER = "2captcha"
             log("2captcha token solved (cost %s, used %d/%d)"
-                % (result.get("cost", "?"), used, TOKEN_BUDGET))
+                % (result.get("cost", "?"), used, get_setting("token_budget", int)))
             return token, UA  # 2captcha tokens are not bound to a specific UA
     raise RuntimeError("2captcha solve timed out")
 
@@ -685,14 +866,25 @@ def solve_with_2captcha():
 def solve_turnstile():
     """Return (token, user_agent) using the configured solver(s).
 
-    auto      -> SurSolver pool first, 2captcha when no key can solve.
+    auto      -> NoCaptchaAI -> SurSolver pool -> 2captcha.
+    nocaptcha -> NoCaptchaAI only.
     sursolver -> SurSolver pool only.
     2captcha  -> 2captcha only.
     """
+    global LAST_SOLVER_PROVIDER
+    LAST_SOLVER_PROVIDER = None
     mode = get_solver_mode()
-    if mode not in ("auto", "sursolver", "2captcha"):
+    if mode not in ("auto", "nocaptcha", "sursolver", "2captcha"):
         log("Unknown SOLVER_MODE %r; using auto" % mode, "ERROR")
         mode = "auto"
+
+    if mode in ("auto", "nocaptcha"):
+        result = solve_with_nocaptcha()
+        if result:
+            return result
+        if mode == "nocaptcha":
+            raise RuntimeError("NoCaptchaAI failed and SOLVER_MODE=nocaptcha")
+        log("NoCaptchaAI unavailable; trying SurSolver")
 
     if mode in ("auto", "sursolver"):
         result = solve_with_sursolver()
@@ -1083,12 +1275,14 @@ def poll_firebase_for_otp(db_url, device_id, sender_pattern, timeout, interval, 
     return None
 
 
-def watch_reward_sms(db_url, device_id, after_key, hit, seconds=90):
+def watch_reward_sms(db_url, device_id, after_key, hit, seconds=None):
     """Watch for the reward SMS, save + alert it, then remove it from the inbox."""
+    if seconds is None:
+        seconds = get_setting("reward_watch_seconds", int)
     deadline = time.time() + seconds
     seen = set()
     while time.time() < deadline:
-        time.sleep(BIGCITY_POLL_INTERVAL)
+        time.sleep(get_setting("bigcity_poll_interval", int))
         try:
             for msg_key, msg in fetch_messages(db_url, device_id, 20).items():
                 if msg_key <= after_key or msg_key in seen or not isinstance(msg, dict):
@@ -1107,10 +1301,13 @@ def watch_reward_sms(db_url, device_id, after_key, hit, seconds=90):
                         "💬 <pre>%s</pre>" % (html.escape(device_id), html.escape(text))
                     )
                     if delivered:
-                        if delete_firebase_message(db_url, device_id, msg_key):
-                            log("  Reward SMS deleted from Firebase (key %s)" % msg_key, "HIT")
+                        if get_setting("delete_reward_sms", bool):
+                            if delete_firebase_message(db_url, device_id, msg_key):
+                                log("  Reward SMS deleted from Firebase (key %s)" % msg_key, "HIT")
+                            else:
+                                log("  Reward SMS deletion failed (key %s)" % msg_key, "ERROR")
                         else:
-                            log("  Reward SMS deletion failed (key %s)" % msg_key, "ERROR")
+                            log("  Reward SMS kept in inbox (delete disabled)")
                     else:
                         log("  Reward SMS kept in inbox: Telegram delivery failed", "ERROR")
         except Exception:
@@ -1162,7 +1359,7 @@ def zomato_send_otp(phone, proxies=None):
         return False
 
 
-def poll_for_zomato_otp(db_url, device_id, timeout=12, interval=3, last_key=None):
+def poll_for_zomato_otp(db_url, device_id, timeout=20, interval=3, last_key=None):
     if last_key is None:
         last_key = get_last_message_key(db_url, device_id)
     start = time.time()
@@ -1189,8 +1386,10 @@ def run_gold_flow(phone, db_url, device_id, poll_otp_fn, proxies=None, baseline_
     """One registration attempt. Returns (True, decoded_response) or (False, {'error': ...})."""
     s = None
     pincode = None
+    stage = "create_session"
     try:
         s, user_key, data_key = gold_create_session(proxies)
+        stage = "get_start"
         gold_get_start(s, user_key)
         name = random_name()
         email = random_email()
@@ -1198,16 +1397,21 @@ def run_gold_flow(phone, db_url, device_id, poll_otp_fn, proxies=None, baseline_
         log("  [%s] Registering: %s / %s / %s" % (phone, name, pincode, user_key))
 
         # One Turnstile token per registration attempt (single-use, fresh).
+        stage = "token"
         token, solver_ua = solve_turnstile()
+        stage = "register"
         gold_register(s, user_key, data_key, phone, name, email, pincode, token, ua=solver_ua)
         log("  [%s] OTP sent. Waiting for BigCity SMS..." % phone)
 
-        otp = poll_otp_fn(BIGCITY_SMS_PATTERN, BIGCITY_OTP_TIMEOUT,
-                          BIGCITY_POLL_INTERVAL, baseline_key)
+        stage = "otp_wait"
+        otp = poll_otp_fn(get_setting("bigcity_sms_pattern", str),
+                          get_setting("bigcity_otp_timeout", int),
+                          get_setting("bigcity_poll_interval", int), baseline_key)
         if not otp:
-            return False, {"error": "BigCity OTP not received in time"}
+            return False, {"error": "BigCity OTP not received in time", "stage": stage, "pincode": pincode}
         log("  [%s] BigCity OTP: %s" % (phone, otp))
 
+        stage = "verify"
         decoded = gold_verify(s, user_key, data_key, otp)
         return True, {
             "decoded": decoded,
@@ -1218,7 +1422,7 @@ def run_gold_flow(phone, db_url, device_id, poll_otp_fn, proxies=None, baseline_
             "pincode": pincode,
         }
     except Exception as exc:
-        return False, {"error": str(exc), "pincode": pincode}
+        return False, {"error": str(exc), "stage": stage, "pincode": pincode}
     finally:
         if s is not None:
             try:
@@ -1359,7 +1563,7 @@ def firebase_worker(instance_id, start_idx, end_idx):
     while RUNNING_FLAGS.get(instance_id, False):
         try:
             with TOKEN_LOCK:
-                used_now, budget = TOKENS_USED, TOKEN_BUDGET
+                used_now, budget = TOKENS_USED, get_setting("token_budget", int)
             log("[*] Inst %s token budget: %d/%d used (~$%.3f spent, ~$%.3f left)"
                 % (instance_id, used_now, budget, used_now * 0.00145,
                    max(0, budget - used_now) * 0.00145))
@@ -1400,11 +1604,12 @@ def firebase_worker(instance_id, start_idx, end_idx):
 
                     # Device-level skips, evaluated with today's IST date at visit.
                     bigcity_today = bigcity_count_today(db_url, device_id)
-                    if bigcity_today >= BIGCITY_DAILY_LIMIT:
-                        log("  [%s] %d BigCity SMS dated today - skipping device"
-                            % (device_id[:12], bigcity_today))
+                    bigcity_limit = get_setting("bigcity_daily_limit", int)
+                    if bigcity_today >= bigcity_limit:
+                        log("  [%s] %d BigCity SMS dated today (limit %d) - skipping device"
+                            % (device_id[:12], bigcity_today, bigcity_limit))
                         continue
-                    if device_marked_today(device_id):
+                    if get_setting("mark_devices", bool) and device_marked_today(device_id):
                         log("  [%s] Already used today (marker) - skipping device"
                             % device_id[:12])
                         continue
@@ -1436,21 +1641,47 @@ def firebase_worker(instance_id, start_idx, end_idx):
                         log("[*] Inst %s Checking: %s | Device: %s"
                             % (instance_id, phone, device_id[:12]))
 
-                        if not zomato_send_otp(phone, proxies=proxy_dict):
+                        zomato_enabled = get_setting("zomato_enabled", bool)
+                        fallback_enabled = get_setting("instamart_fallback", bool)
+                        if not zomato_enabled:
+                            log("    [-] Zomato disabled; using Instamart")
+                            if not instamart_send_otp(phone, proxies=proxy_dict):
+                                log("    [-] Instamart also failed")
+                                release_claim(phone)
+                                continue
+                            if not poll_for_instamart_otp(
+                                    db_url, device_id,
+                                    timeout=get_setting("instamart_otp_timeout", int),
+                                    interval=get_setting("instamart_poll_interval", int),
+                                    last_key=zomato_baseline):
+                                log("    [-] Instamart OTP not received on device")
+                                release_claim(phone)
+                                continue
+                        elif not zomato_send_otp(phone, proxies=proxy_dict):
                             # Fallback only when Zomato rejected the number or errored.
                             # A missing Zomato OTP after a successful send is NOT a fallback case.
+                            if not fallback_enabled:
+                                log("    [-] Zomato rejected/errored; fallback disabled")
+                                release_claim(phone)
+                                continue
                             log("    [-] Zomato rejected/errored; trying Instamart fallback")
                             if not instamart_send_otp(phone, proxies=proxy_dict):
                                 log("    [-] Instamart fallback also failed")
                                 release_claim(phone)
                                 continue
-                            if not poll_for_instamart_otp(db_url, device_id,
-                                                          last_key=zomato_baseline):
+                            if not poll_for_instamart_otp(
+                                    db_url, device_id,
+                                    timeout=get_setting("instamart_otp_timeout", int),
+                                    interval=get_setting("instamart_poll_interval", int),
+                                    last_key=zomato_baseline):
                                 log("    [-] Instamart OTP not received on device")
                                 release_claim(phone)
                                 continue
-                        elif not poll_for_zomato_otp(db_url, device_id,
-                                                     last_key=zomato_baseline):
+                        elif not poll_for_zomato_otp(
+                                db_url, device_id,
+                                timeout=get_setting("zomato_otp_timeout", int),
+                                interval=get_setting("zomato_poll_interval", int),
+                                last_key=zomato_baseline):
                             log("    [-] Zomato OTP not received on device; skipping")
                             release_claim(phone)
                             continue
@@ -1463,18 +1694,40 @@ def firebase_worker(instance_id, start_idx, end_idx):
                                                          timeout, interval, last_key=l_key)
 
                         # 5 attempts per number, fresh session and fresh OTP each time.
-                        for attempt in range(1, ATTEMPTS_PER_NUMBER + 1):
+                        attempts_per_number = get_setting("attempts_per_number", int)
+                        for attempt in range(1, attempts_per_number + 1):
                             if not RUNNING_FLAGS.get(instance_id, False):
                                 break
                             # Baselines are taken per attempt so an OTP from a previous
                             # attempt is never mistaken for the current one.
                             baseline = get_last_message_key(db_url, device_id)
-                            log("    [*] Attempt %d/%d for %s" % (attempt, ATTEMPTS_PER_NUMBER, phone))
+                            log("    [*] Attempt %d/%d for %s" % (attempt, attempts_per_number, phone))
 
-                            ok, result = run_gold_flow(
-                                phone, db_url, device_id, poll_bigcity,
-                                proxies=proxy_dict, baseline_key=baseline,
-                            )
+                            # Retry transport failures in place so a proxy timeout
+                            # does not consume an attempt. Only before the token stage —
+                            # after a token is bought, a retry would cost another solve.
+                            net_tries = 0
+                            while True:
+                                ok, result = run_gold_flow(
+                                    phone, db_url, device_id, poll_bigcity,
+                                    proxies=proxy_dict, baseline_key=baseline,
+                                )
+                                if ok:
+                                    break
+                                err = str(result.get("error", ""))
+                                stage = result.get("stage", "")
+                                if (is_connection_error(err)
+                                        and stage in ("create_session", "get_start")
+                                        and net_tries < get_setting("network_retries", int)
+                                        and RUNNING_FLAGS.get(instance_id, False)):
+                                    net_tries += 1
+                                    delay = NETWORK_BACKOFF[min(net_tries - 1, len(NETWORK_BACKOFF) - 1)]
+                                    log("    [~] Network retry %d/%d for attempt %d in %ds: %s"
+                                        % (net_tries, get_setting("network_retries", int), attempt,
+                                           delay, err[:120]), "ERROR")
+                                    time.sleep(delay)
+                                    continue
+                                break
 
                             if ok:
                                 decoded = result["decoded"]
@@ -1514,8 +1767,11 @@ def firebase_worker(instance_id, start_idx, end_idx):
                                 if already:
                                     with USED_NUMBERS_LOCK:
                                         USED_NUMBERS.add(phone)
-                                    mark_device_used_today(device_id)
-                                    log("    [~] Number already used today, skipping: %s | device marked for today" % phone)
+                                    marked = get_setting("mark_devices", bool)
+                                    if marked:
+                                        mark_device_used_today(device_id)
+                                    log("    [~] Number already used today, skipping: %s%s"
+                                        % (phone, " | device marked for today" if marked else ""))
                                     break  # stop attempts for this number only; other numbers continue
                                 if token_error:
                                     # Never burn the remaining tokens on a rejected token.
@@ -1574,8 +1830,21 @@ def test_token_flow(phone="8000958285"):
 
 def dry_run():
     log("=== DRY RUN (no live site requests) ===")
-    log("2captcha key: %s | budget: %d tokens" % ("set" if TWOCAPTCHA_KEY else "NOT SET", TOKEN_BUDGET))
-    log("Solver mode: %s | SurSolver keys: %d" % (get_solver_mode(), len(get_sursolver_keys())))
+    log("2captcha key: %s | budget: %d tokens"
+        % ("set" if TWOCAPTCHA_KEY else "NOT SET", get_setting("token_budget", int)))
+    log("Solver mode: %s | NoCaptchaAI key: %s | SurSolver keys: %d"
+        % (get_solver_mode(), "set" if get_nocaptcha_key() else "NOT SET",
+           len(get_sursolver_keys())))
+    assert get_solver_mode() in ("auto", "nocaptcha", "sursolver", "2captcha")
+    assert set(SECTIONS["solver"]) <= set(DEFAULTS)
+    assert set(SECTIONS["device"]) <= set(DEFAULTS)
+    assert set(SECTIONS["liveness"]) <= set(DEFAULTS)
+    assert set(SECTIONS["reward"]) <= set(DEFAULTS)
+    assert get_setting("bigcity_daily_limit", int) == 5
+    assert get_setting("mark_devices", bool) is True
+    assert get_setting("zomato_otp_timeout", int) == 20
+    assert get_setting("reward_watch_seconds", int) == 90
+    log("Live settings + section defaults: verified")
 
     # Solver pool: rotation, exhaustion marker and key-label privacy.
     old_state = dict(SURSOLVER_KEY_STATE)
@@ -1612,16 +1881,39 @@ def dry_run():
     assert is_pincode_error(pincode_error), "pincode rejection not detected"
     assert not is_pincode_error("BigCity OTP not received in time")
     old_rejected = set(REJECTED_PINCODES)
+    old_rejected_file = REJECTED_PINCODES_FILE
+    import tempfile
+    tmp_dir = tempfile.mkdtemp(prefix="gd-rejected-")
     try:
+        globals()["REJECTED_PINCODES_FILE"] = os.path.join(tmp_dir, "rejected_pincodes.json")
+        with PINCODE_LOCK:
+            REJECTED_PINCODES.clear()
         bad = PINCODES[0]
         reject_pincode(bad)
         drawn = [next_pincode() for _ in range(len(PINCODES))]
         assert str(bad) not in drawn, "rejected pincode still drawn from pool"
+        # simulate a restart: clear memory, reload from the saved file
+        with PINCODE_LOCK:
+            REJECTED_PINCODES.clear()
+        load_rejected_pincodes()
+        assert bad in REJECTED_PINCODES, "rejected pincode not restored after restart"
+        drawn = [next_pincode() for _ in range(len(PINCODES))]
+        assert str(bad) not in drawn, "rejected pincode drawn after simulated restart"
+        reset_rejected_pincodes()
+        assert bad not in REJECTED_PINCODES, "reset did not clear rejected pincodes"
     finally:
+        globals()["REJECTED_PINCODES_FILE"] = old_rejected_file
         with PINCODE_LOCK:
             REJECTED_PINCODES.clear()
             REJECTED_PINCODES.update(old_rejected)
-    log("Pincode rejection: detected, removed from pool, and not redrawn")
+        try:
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+    log("Pincode rejection: persisted across restart, skipped, and reset verified")
+    assert get_setting("zomato_otp_timeout", int) == 20, "Zomato timeout should be 20 seconds"
+    assert get_setting("bigcity_daily_limit", int) == 5, "BigCity skip limit should be 5"
 
     dk = "Fh10onmVEwyPjsDMpdEOxQ0"
     _, data_field = gold_sign({"otp": "972357", "userKey": "1854843220"}, dk)
@@ -1704,7 +1996,9 @@ def dry_run():
                    "504 Gateway Time-out')))")
     assert is_connection_error(proxy_error), "proxy error not classified as routine"
     assert not is_connection_error("Registration failed: {'messageId': 'participation'}")
-    log("Proxy/network errors: classified as routine, no Telegram alert")
+    assert get_setting("network_retries", int) == 3, "network retry count should be 3"
+    log("Proxy/network errors: routine, %d in-place retries before token stage"
+        % get_setting("network_retries", int))
 
     assert is_instamart_message({
         "sender": "VM-SWIGGY-S",
@@ -1773,13 +2067,14 @@ def firebases_page():
 
 @app.route("/settings")
 def settings_page():
-    settings = load_settings()
+    settings = dict(DEFAULTS)
+    settings.update(load_settings())
     keys = settings.get("sursolver_keys", "")
     if isinstance(keys, list):
         settings["sursolver_keys"] = ", ".join(str(k) for k in keys)
     elif not isinstance(keys, str):
         settings["sursolver_keys"] = ""
-    return render_template("settings.html", settings=settings)
+    return render_template("settings.html", settings=settings, sections=SECTIONS)
 
 
 @app.route("/api/instances", methods=["POST"])
@@ -1895,7 +2190,7 @@ def api_test_solver():
     try:
         mode = get_solver_mode()
         token, ua = solve_turnstile()
-        provider = "sursolver" if ua == SURSOLVER_UA else "2captcha"
+        provider = LAST_SOLVER_PROVIDER or "unknown"
         return jsonify({
             "status": "success",
             "provider": provider,
@@ -1905,6 +2200,59 @@ def api_test_solver():
         })
     except Exception as exc:
         return jsonify({"status": "error", "message": str(exc)})
+
+
+@app.route("/api/settings/reset", methods=["POST"])
+def api_reset_section():
+    """Restore one Settings section to its defaults."""
+    section = (request.json or {}).get("section", "")
+    if section not in SECTIONS:
+        return jsonify({"status": "error", "message": "Unknown section: %s" % section}), 400
+    settings = load_settings()
+    for key in SECTIONS[section]:
+        settings[key] = DEFAULTS[key]
+    save_settings(settings)
+    return jsonify({"status": "success", "section": section})
+
+
+@app.route("/api/nocaptcha/balance", methods=["POST"])
+def api_nocaptcha_balance():
+    """Check the NoCaptchaAI key and show its plan/balance."""
+    key = (request.json or {}).get("key", "").strip() or get_nocaptcha_key()
+    if not key:
+        return jsonify({"status": "error", "message": "No NoCaptchaAI key configured"})
+    try:
+        r = requests.get(NOCAPTCHA_BALANCE_URL, params={"apiKey": key}, timeout=20).json()
+        if r.get("status") == "ok" or "balance" in r:
+            plan = r.get("plan") or {}
+            return jsonify({
+                "status": "success",
+                "balance": r.get("balance"),
+                "daily_limit": plan.get("dailyLimit"),
+                "daily_used": plan.get("dailyLimitUsed"),
+                "username": r.get("username"),
+            })
+        return jsonify({"status": "error", "message": str(r)[:300]})
+    except Exception as exc:
+        return jsonify({"status": "error", "message": str(exc)})
+
+
+@app.route("/api/device-marks/reset", methods=["POST"])
+def api_reset_device_marks():
+    try:
+        with DEVICE_MARKS_LOCK:
+            if os.path.exists(DEVICE_MARKS_FILE):
+                os.remove(DEVICE_MARKS_FILE)
+        remaining = 0
+    except Exception as exc:
+        return jsonify({"status": "error", "message": str(exc)})
+    return jsonify({"status": "success", "remaining": remaining})
+
+
+@app.route("/api/pincodes/reset", methods=["POST"])
+def api_reset_pincodes():
+    reset_rejected_pincodes()
+    return jsonify({"status": "success", "rejected": len(REJECTED_PINCODES)})
 
 
 @app.route("/api/update-links", methods=["POST"])
