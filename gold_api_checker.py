@@ -137,7 +137,7 @@ ZOMATO_OTP_TIMEOUT = 20
 ZOMATO_POLL_INTERVAL = 3
 
 # Transport failures (proxy tunnel timeout, connection reset, etc.) are retried
-# in place without consuming one of the 5 attempts — but only before a solver
+# in place without consuming one of the attempts — but only before a solver
 # token has been bought. A network failure after the token stage counts as a
 # normal attempt so we never pay for a second token on the same attempt.
 NETWORK_RETRIES = int(os.environ.get("NETWORK_RETRIES", "3")
@@ -145,8 +145,10 @@ NETWORK_RETRIES = int(os.environ.get("NETWORK_RETRIES", "3")
 NETWORK_BACKOFF = (2, 4, 8)
 
 NUM_WORKERS = 3
-ATTEMPTS_PER_NUMBER = int(os.environ.get("ATTEMPTS_PER_NUMBER", "5")
-                         or ENV_VALUES.get("ATTEMPTS_PER_NUMBER", "5"))
+# The campaign allows a maximum of 3 registrations per mobile number per day.
+# Attempts 4+ can never succeed and only waste a solver token.
+ATTEMPTS_PER_NUMBER = int(os.environ.get("ATTEMPTS_PER_NUMBER", "3")
+                         or ENV_VALUES.get("ATTEMPTS_PER_NUMBER", "3"))
 BATCH_CODE = "KKD2LS01261026"
 
 # Skip a device once it has this many BigCity messages dated today.
@@ -175,7 +177,7 @@ DEFAULTS = {
     "bigcity_daily_limit": 5,
     "bigcity_sms_pattern": "BGCITY",
     "mark_devices": True,
-    "attempts_per_number": 5,
+    "attempts_per_number": 3,
     # liveness
     "zomato_enabled": True,
     "instamart_fallback": True,
@@ -295,11 +297,16 @@ PINCODE_CURSOR = 0
 REJECTED_PINCODES = set()
 
 # In-memory optimisation state (no processed.txt / burned_phones.txt).
-USED_NUMBERS = set()        # numbers that returned participation this process
+USED_NUMBERS = {}           # phone -> IST date when it was marked used
 USED_NUMBERS_LOCK = threading.Lock()
 CLAIMED_NUMBERS = set()     # numbers currently being worked by a worker
 CLAIMED_LOCK = threading.Lock()
 DEVICE_MARKS_LOCK = threading.Lock()
+
+# Manual runner: its own isolated sessions. Never touches automatic worker state.
+MANUAL_SESSIONS = {}
+MANUAL_LOCK = threading.Lock()
+MANUAL_TTL = 600  # seconds
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36")
@@ -443,20 +450,33 @@ def send_telegram_alert(message):
 
 # ─── File Helpers ───────────────────────────────────────────────────────────
 
+def parse_firebase_links(raw):
+    """Accept plain URLs, one per line, or Nexus 'URL: <db>' export blocks."""
+    urls = []
+    text = raw
+    if isinstance(raw, list):
+        text = "\n".join(str(x) for x in raw)
+    for line in str(text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.upper().startswith("URL:"):
+            line = line.split(":", 1)[1].strip()
+        line = line.rstrip("/")
+        if line.startswith("http") and line not in urls:
+            urls.append(line)
+    return urls
+
+
 def load_firebase_links():
-    """Parse the Nexus export format in link.txt ("URL: <db>" blocks)."""
+    """Load Firebase URLs from link.txt (plain or Nexus export format)."""
     if not os.path.exists(LINKS_FILE):
         return []
-    urls = []
-    with open(LINKS_FILE, "r", encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line.upper().startswith("URL:"):
-                continue
-            url = line.split(":", 1)[1].strip().rstrip("/")
-            if url.startswith("http") and url not in urls:
-                urls.append(url)
-    return urls
+    try:
+        with open(LINKS_FILE, "r", encoding="utf-8", errors="replace") as handle:
+            return parse_firebase_links(handle.read())
+    except Exception:
+        return []
 
 
 def save_hit(hit):
@@ -1086,9 +1106,26 @@ USED_TODAY_MARKERS = (
 
 
 def is_used_today_error(error):
-    """True for the server's 'already used today' participation response."""
+    """True for 'already used today' or 'OTP limit exhausted' responses."""
     text = str(error).lower()
-    return any(marker in text for marker in USED_TODAY_MARKERS)
+    if any(marker in text for marker in USED_TODAY_MARKERS):
+        return True
+    return ("otp limit" in text and "exhausted" in text) or "otp limit for today" in text
+
+
+def mark_number_used_today(phone):
+    with USED_NUMBERS_LOCK:
+        USED_NUMBERS[str(phone)] = today_key()
+
+
+def is_number_used_today(phone):
+    with USED_NUMBERS_LOCK:
+        return USED_NUMBERS.get(str(phone)) == today_key()
+
+
+def clear_used_numbers():
+    with USED_NUMBERS_LOCK:
+        USED_NUMBERS.clear()
 
 
 def is_pincode_error(error):
@@ -1627,7 +1664,7 @@ def firebase_worker(instance_id, start_idx, end_idx):
                     for phone in numbers:
                         if not RUNNING_FLAGS.get(instance_id, False):
                             break
-                        if phone in USED_NUMBERS:
+                        if is_number_used_today(phone):
                             log("    [~] Already used today (cache), skipping: %s" % phone)
                             continue
                         with CLAIMED_LOCK:
@@ -1693,7 +1730,7 @@ def firebase_worker(instance_id, start_idx, end_idx):
                             return poll_firebase_for_otp(_fb, _dev, pattern,
                                                          timeout, interval, last_key=l_key)
 
-                        # 5 attempts per number, fresh session and fresh OTP each time.
+                        # Up to 3 attempts per number (campaign daily limit), fresh session and OTP each time.
                         attempts_per_number = get_setting("attempts_per_number", int)
                         for attempt in range(1, attempts_per_number + 1):
                             if not RUNNING_FLAGS.get(instance_id, False):
@@ -1758,6 +1795,7 @@ def firebase_worker(instance_id, start_idx, end_idx):
                                     or any(kw in error_lower for kw in (
                                         "otp not received in time",
                                         "otp verification failed",
+                                        "otp limit",
                                         "read timed out",
                                         "timed out",
                                         "connection pool",
@@ -1765,12 +1803,11 @@ def firebase_worker(instance_id, start_idx, end_idx):
                                     ))
                                 )
                                 if already:
-                                    with USED_NUMBERS_LOCK:
-                                        USED_NUMBERS.add(phone)
+                                    mark_number_used_today(phone)
                                     marked = get_setting("mark_devices", bool)
                                     if marked:
                                         mark_device_used_today(device_id)
-                                    log("    [~] Number already used today, skipping: %s%s"
+                                    log("    [~] Number already used today / OTP limit reached, skipping: %s%s"
                                         % (phone, " | device marked for today" if marked else ""))
                                     break  # stop attempts for this number only; other numbers continue
                                 if token_error:
@@ -1928,9 +1965,14 @@ def dry_run():
     used_error = ("Registration failed: {'statusCode': 400, 'message': "
                   "'Please try again tomorrow using the same number', "
                   "'messageId': 'participation'}")
+    otp_limit_error = ("Registration failed: {'statusCode': 400, 'message': "
+                       "'Your OTP limit for today is exhausted. Please try again tomorrow', "
+                       "'messageId': 'otp'}")
     assert is_used_today_error(used_error), "participation error not classified as used-today"
+    assert is_used_today_error(otp_limit_error), "daily OTP-limit error not classified as used-today"
     assert not is_used_today_error("BigCity OTP not received in time")
-    log("Used-today detection: participation error matched, routine OTP error not matched")
+    assert get_setting("attempts_per_number", int) == 3, "attempts per number should be 3"
+    log("Used-today detection: participation + OTP-limit matched; attempts default 3")
 
     # Device day-marker: date key, today-only skip, midnight rollover.
     assert re.match(r"^\d{4}-\d{2}-\d{2}$", today_key()), "today_key format wrong"
@@ -1969,18 +2011,26 @@ def dry_run():
         globals()["fetch_messages"] = old_fetch
     log("BigCity daily count: only today's messages counted")
 
-    # Claim / used-number cache helpers.
+    # Claim / used-number cache helpers. Used numbers expire at midnight.
     old_claimed = set(CLAIMED_NUMBERS)
-    old_used = set(USED_NUMBERS)
+    old_used = dict(USED_NUMBERS)
     try:
         with CLAIMED_LOCK:
             CLAIMED_NUMBERS.clear()
-        with USED_NUMBERS_LOCK:
-            USED_NUMBERS.clear()
+        clear_used_numbers()
         with CLAIMED_LOCK:
             CLAIMED_NUMBERS.add("dry-phone")
         release_claim("dry-phone")
         assert "dry-phone" not in CLAIMED_NUMBERS, "claim not released"
+
+        mark_number_used_today("dry-phone")
+        assert is_number_used_today("dry-phone"), "used number not cached for today"
+        # simulate next calendar date: a yesterday mark must not skip tomorrow
+        with USED_NUMBERS_LOCK:
+            USED_NUMBERS["dry-phone"] = (datetime.now(IST) - timedelta(days=1)).strftime("%Y-%m-%d")
+        assert not is_number_used_today("dry-phone"), "used-number cache leaked into next day"
+        clear_used_numbers()
+        assert not is_number_used_today("dry-phone"), "reset did not clear used-number cache"
     finally:
         with CLAIMED_LOCK:
             CLAIMED_NUMBERS.clear()
@@ -1988,7 +2038,7 @@ def dry_run():
         with USED_NUMBERS_LOCK:
             USED_NUMBERS.clear()
             USED_NUMBERS.update(old_used)
-    log("Claim/used caches: claim release verified")
+    log("Claim/used caches: claim release + midnight rollover verified")
 
     proxy_error = ("HTTPSConnectionPool(host='golddropgolddhamaka.com', port=443): "
                    "Max retries exceeded with url: /api/users (Caused by ProxyError("
@@ -2031,6 +2081,143 @@ def health():
         "instances": len(load_instances()),
         "running": sorted(str(k) for k, v in RUNNING_FLAGS.items() if v),
     })
+
+
+# ─── Manual runner (isolated from automatic workers) ───────────────────────
+
+def manual_prune():
+    now = time.time()
+    with MANUAL_LOCK:
+        for sid in [k for k, v in MANUAL_SESSIONS.items()
+                    if now - v.get("created", 0) > MANUAL_TTL]:
+            entry = MANUAL_SESSIONS.pop(sid, None)
+            try:
+                if entry and entry.get("session"):
+                    entry["session"].close()
+            except Exception:
+                pass
+
+
+def manual_start(phone):
+    """Create a fresh session, solve one token, register. Returns session id."""
+    manual_prune()
+    if not re.fullmatch(r"[6-9]\d{9}", str(phone).strip()):
+        raise RuntimeError("Enter a valid 10-digit mobile number")
+    proxy = get_proxy()
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    s, user_key, data_key = gold_create_session(proxies)
+    gold_get_start(s, user_key)
+    token, ua = solve_turnstile()
+    name = random_name()
+    email = random_email()
+    pincode = next_pincode()
+    gold_register(s, user_key, data_key, phone, name, email, pincode, token, ua=ua)
+
+    sid = uuid.uuid4().hex
+    with MANUAL_LOCK:
+        MANUAL_SESSIONS[sid] = {
+            "session": s,
+            "user_key": user_key,
+            "data_key": data_key,
+            "phone": phone,
+            "name": name,
+            "email": email,
+            "pincode": pincode,
+            "created": time.time(),
+        }
+    return sid
+
+
+def manual_verify(sid, otp):
+    manual_prune()
+    with MANUAL_LOCK:
+        entry = MANUAL_SESSIONS.get(sid)
+    if not entry:
+        raise RuntimeError("Manual session expired. Start again.")
+    if not re.fullmatch(r"\d{6}", str(otp).strip()):
+        raise RuntimeError("OTP must be 6 digits")
+    decoded = gold_verify(entry["session"], entry["user_key"], entry["data_key"], str(otp).strip())
+    result = {
+        "win": classify_win(decoded),
+        "win_type": decoded.get("win_type"),
+        "reward": decoded.get("reward"),
+        "full_response": decoded,
+        "phone": entry["phone"],
+    }
+    if result["win"]:
+        hit = {
+            "campaign": "gold-drop-manual",
+            "phone": entry["phone"],
+            "device_id": "manual",
+            "firebase_url": "manual",
+            "user_key": entry["user_key"],
+            "name": entry["name"],
+            "email": entry["email"],
+            "pincode": entry["pincode"],
+            "win_type": decoded.get("win_type"),
+            "reward": decoded.get("reward"),
+            "full_response": decoded,
+            "timestamp": datetime.now(IST).isoformat(),
+        }
+        save_hit(hit)
+        pretty = json.dumps(decoded, indent=2, ensure_ascii=False)
+        send_telegram_alert(
+            "🏆 <b>GOLD DROP MANUAL WIN!</b>\n"
+            "📱 Phone: <code>%s</code>\n"
+            "🎁 win_type: <code>%s</code>\n"
+            "📦 <b>FULL RESPONSE</b>:\n<pre>%s</pre>"
+            % (entry["phone"], html.escape(str(decoded.get("win_type"))), html.escape(pretty))
+        )
+    # cleanup this session
+    with MANUAL_LOCK:
+        gone = MANUAL_SESSIONS.pop(sid, None)
+    try:
+        if gone and gone.get("session"):
+            gone["session"].close()
+    except Exception:
+        pass
+    return result
+
+
+@app.route("/manual")
+def manual_page():
+    return render_template("manual.html")
+
+
+@app.route("/api/manual/start", methods=["POST"])
+def api_manual_start():
+    try:
+        phone = (request.json or {}).get("phone", "")
+        sid = manual_start(phone)
+        return jsonify({"status": "success", "session_id": sid,
+                        "message": "OTP requested. Check the number's inbox."})
+    except Exception as exc:
+        return jsonify({"status": "error", "message": str(exc)})
+
+
+@app.route("/api/manual/verify", methods=["POST"])
+def api_manual_verify():
+    try:
+        data = request.json or {}
+        result = manual_verify(data.get("session_id", ""), data.get("otp", ""))
+        return jsonify({"status": "success", **result})
+    except Exception as exc:
+        return jsonify({"status": "error", "message": str(exc)})
+
+
+@app.route("/api/manual/reset", methods=["POST"])
+def api_manual_reset():
+    global MANUAL_SESSIONS
+    manual_prune()
+    with MANUAL_LOCK:
+        for entry in MANUAL_SESSIONS.values():
+            try:
+                if entry.get("session"):
+                    entry["session"].close()
+            except Exception:
+                pass
+        MANUAL_SESSIONS = {}
+    return jsonify({"status": "success"})
 
 
 @app.route("/")
@@ -2243,10 +2430,12 @@ def api_reset_device_marks():
         with DEVICE_MARKS_LOCK:
             if os.path.exists(DEVICE_MARKS_FILE):
                 os.remove(DEVICE_MARKS_FILE)
+        clear_used_numbers()  # in-memory used-number cache also cleared
         remaining = 0
     except Exception as exc:
         return jsonify({"status": "error", "message": str(exc)})
-    return jsonify({"status": "success", "remaining": remaining})
+    return jsonify({"status": "success", "remaining": remaining,
+                    "used_numbers_cleared": True})
 
 
 @app.route("/api/pincodes/reset", methods=["POST"])
@@ -2257,10 +2446,26 @@ def api_reset_pincodes():
 
 @app.route("/api/update-links", methods=["POST"])
 def api_update_links():
-    links = (request.json or {}).get("links", "")
+    raw = (request.json or {}).get("links", "")
+    urls = parse_firebase_links(raw)
+    normalized = "\n".join(urls)
     with open(LINKS_FILE, "w", encoding="utf-8") as handle:
-        handle.write(links)
-    return jsonify({"status": "saved"})
+        handle.write(normalized)
+    return jsonify({"status": "saved", "count": len(urls)})
+
+
+@app.route("/api/add-link", methods=["POST"])
+def api_add_link():
+    """Append one Firebase URL without disturbing existing links."""
+    url = str((request.json or {}).get("url", "")).strip().rstrip("/")
+    if not url.startswith("http"):
+        return jsonify({"status": "error", "message": "Enter a valid http(s) URL"})
+    urls = load_firebase_links()
+    if url not in urls:
+        urls.append(url)
+        with open(LINKS_FILE, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(urls))
+    return jsonify({"status": "saved", "count": len(urls)})
 
 
 def auto_bootstrap():
