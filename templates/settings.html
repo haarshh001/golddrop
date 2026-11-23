@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Gold Drop Checker - Settings</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #0f172a; color: #e2e8f0; }
+        .navbar { background: #1e293b; padding: 16px 24px; display: flex; align-items: center; gap: 24px; border-bottom: 1px solid #334155; }
+        .navbar h1 { font-size: 20px; color: #38bdf8; }
+        .navbar a { color: #94a3b8; text-decoration: none; padding: 6px 12px; border-radius: 6px; }
+        .navbar a:hover, .navbar a.active { color: #e2e8f0; background: #334155; }
+        .container { max-width: 900px; margin: 24px auto; padding: 0 24px; }
+        .card { background: #1e293b; border-radius: 12px; padding: 24px; border: 1px solid #334155; margin-bottom: 24px; }
+        .card-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+        .card h3 { color: #38bdf8; font-size: 18px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+        .form-group label { display: block; color: #94a3b8; font-size: 13px; margin-bottom: 6px; }
+        .form-group input, .form-group select, .form-group textarea { width: 100%; padding: 10px 12px; background: #0f172a; color: #e2e8f0; border: 1px solid #334155; border-radius: 8px; font-size: 14px; }
+        .form-group textarea { min-height: 80px; resize: vertical; font-family: monospace; }
+        .form-group small { color: #64748b; font-size: 11px; margin-top: 4px; display: block; }
+        .check { display: flex; align-items: center; gap: 10px; padding-top: 22px; }
+        .check input { width: 18px; height: 18px; }
+        .check label { color: #e2e8f0; font-size: 14px; }
+        .btn { padding: 9px 18px; border-radius: 8px; border: none; font-size: 13px; font-weight: 600; cursor: pointer; background: #38bdf8; color: #0f172a; }
+        .btn-sm { padding: 6px 12px; font-size: 12px; }
+        .btn-red { background: #ef4444; color: #fff; }
+        .btn-amber { background: #f59e0b; color: #0f172a; }
+        .btn-purple { background: #a855f7; color: #fff; }
+        .btn-green { background: #22c55e; color: #0f172a; }
+        .actions { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 24px; }
+        #result { margin-top: 12px; font-size: 14px; display: none; padding: 16px; border-radius: 8px; background: #0f172a; border: 1px solid #334155; }
+    </style>
+</head>
+<body>
+    <nav class="navbar">
+        <h1>🎯 Gold Drop Checker</h1>
+        <a href="/">Dashboard</a>
+        <a href="/logs">Logs</a>
+        <a href="/hits">Hits</a>
+        <a href="/firebases">Firebase</a>
+        <a href="/manual">Manual</a>
+        <a href="/settings" class="active">Settings</a>
+    </nav>
+    <div class="container">
+        <div class="actions">
+            <button class="btn" onclick="saveAll()">💾 Save All Settings</button>
+            <button class="btn btn-green" onclick="testProxy()">🔌 Test Proxy</button>
+            <button class="btn btn-purple" onclick="testSolver()">🧪 Test Solver</button>
+            <button class="btn btn-purple" onclick="testNocaptcha()">🧪 Test NoCaptcha Balance</button>
+        </div>
+
+        <div class="card">
+            <div class="card-head"><h3>⚙️ Proxy</h3><button class="btn btn-sm btn-red" onclick="resetSection('proxy')">Reset to default</button></div>
+            <div class="form-group">
+                <label>HTTP Proxy (Zomato & Gold Drop API)</label>
+                <input type="text" data-setting="proxy" value="{{ settings.proxy or '' }}" placeholder="http://user:pass@host:port">
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-head"><h3>🔑 Solver</h3><button class="btn btn-sm btn-red" onclick="resetSection('solver')">Reset to default</button></div>
+            <div class="grid">
+                <div class="form-group">
+                    <label>Solver mode</label>
+                    <select data-setting="solver_mode">
+                        <option value="auto" {% if settings.solver_mode == 'auto' %}selected{% endif %}>auto (NoCaptchaAI → SurSolver → 2captcha)</option>
+                        <option value="nocaptcha" {% if settings.solver_mode == 'nocaptcha' %}selected{% endif %}>nocaptcha only</option>
+                        <option value="sursolver" {% if settings.solver_mode == 'sursolver' %}selected{% endif %}>sursolver only</option>
+                        <option value="2captcha" {% if settings.solver_mode == '2captcha' %}selected{% endif %}>2captcha only</option>
+                    </select>
+                </div>
+                <div class="form-group"><label>NoCaptchaAI API key</label><input type="text" data-setting="nocaptcha_key" value="{{ settings.nocaptcha_key or '' }}" placeholder="barshaann-..."></div>
+                <div class="form-group"><label>2captcha API key</label><input type="text" data-setting="twocaptcha_key" value="{{ settings.twocaptcha_key or '' }}"></div>
+                <div class="form-group"><label>Token budget (2captcha)</label><input type="number" data-setting="token_budget" data-type="int" value="{{ settings.token_budget }}"></div>
+                <div class="form-group"><label>Network retries</label><input type="number" data-setting="network_retries" data-type="int" value="{{ settings.network_retries }}"></div>
+            </div>
+            <div class="form-group" style="margin-top:16px;">
+                <label>SurSolver API keys (comma separated)</label>
+                <textarea data-setting="sursolver_keys" data-type="list" placeholder="sur_...,sur_...">{{ settings.sursolver_keys or '' }}</textarea>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-head"><h3>📱 Device & Campaign</h3><button class="btn btn-sm btn-red" onclick="resetSection('device')">Reset to default</button></div>
+            <div class="grid">
+                <div class="form-group"><label>Skip device after N BigCity SMS today (0 = never)</label><input type="number" data-setting="bigcity_daily_limit" data-type="int" value="{{ settings.bigcity_daily_limit }}"></div>
+                <div class="form-group"><label>BigCity sender pattern</label><input type="text" data-setting="bigcity_sms_pattern" value="{{ settings.bigcity_sms_pattern }}"></div>
+                <div class="form-group"><label>Attempts per number (max 3/day)</label><input type="number" data-setting="attempts_per_number" data-type="int" value="{{ settings.attempts_per_number }}"></div>
+                <div class="check"><input type="checkbox" data-setting="mark_devices" data-type="bool" id="mark_devices" {% if settings.mark_devices %}checked{% endif %}><label for="mark_devices">Save used devices</label></div>
+            </div>
+            <div class="actions" style="margin:16px 0 0;">
+                <button class="btn btn-sm btn-amber" onclick="resetDeviceMarks()">♻️ Reset used devices & numbers</button>
+                <button class="btn btn-sm btn-amber" onclick="resetPincodes()">♻️ Reset rejected pincodes</button>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-head"><h3>🌐 Liveness Gates</h3><button class="btn btn-sm btn-red" onclick="resetSection('liveness')">Reset to default</button></div>
+            <div class="grid">
+                <div class="check"><input type="checkbox" data-setting="zomato_enabled" data-type="bool" id="zomato_enabled" {% if settings.zomato_enabled %}checked{% endif %}><label for="zomato_enabled">Use Zomato gate</label></div>
+                <div class="check"><input type="checkbox" data-setting="instamart_fallback" data-type="bool" id="instamart_fallback" {% if settings.instamart_fallback %}checked{% endif %}><label for="instamart_fallback">Instamart fallback</label></div>
+                <div class="form-group"><label>Zomato OTP timeout (s)</label><input type="number" data-setting="zomato_otp_timeout" data-type="int" value="{{ settings.zomato_otp_timeout }}"></div>
+                <div class="form-group"><label>Zomato poll (s)</label><input type="number" data-setting="zomato_poll_interval" data-type="int" value="{{ settings.zomato_poll_interval }}"></div>
+                <div class="form-group"><label>Instamart OTP timeout (s)</label><input type="number" data-setting="instamart_otp_timeout" data-type="int" value="{{ settings.instamart_otp_timeout }}"></div>
+                <div class="form-group"><label>Instamart poll (s)</label><input type="number" data-setting="instamart_poll_interval" data-type="int" value="{{ settings.instamart_poll_interval }}"></div>
+                <div class="form-group"><label>BigCity OTP timeout (s)</label><input type="number" data-setting="bigcity_otp_timeout" data-type="int" value="{{ settings.bigcity_otp_timeout }}"></div>
+                <div class="form-group"><label>BigCity poll (s)</label><input type="number" data-setting="bigcity_poll_interval" data-type="int" value="{{ settings.bigcity_poll_interval }}"></div>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-head"><h3>🎁 Reward & Telegram</h3><button class="btn btn-sm btn-red" onclick="resetSection('reward')">Reset to default</button></div>
+            <div class="grid">
+                <div class="form-group"><label>Reward SMS watch (s)</label><input type="number" data-setting="reward_watch_seconds" data-type="int" value="{{ settings.reward_watch_seconds }}"></div>
+                <div class="check"><input type="checkbox" data-setting="delete_reward_sms" data-type="bool" id="delete_reward_sms" {% if settings.delete_reward_sms %}checked{% endif %}><label for="delete_reward_sms">Delete reward SMS after alert</label></div>
+                <div class="form-group"><label>Telegram bot token</label><input type="text" data-setting="tg_bot_token" value="{{ settings.tg_bot_token }}"></div>
+                <div class="form-group"><label>Telegram chat ID</label><input type="text" data-setting="tg_chat_id" value="{{ settings.tg_chat_id }}"></div>
+            </div>
+        </div>
+
+        <div id="result"></div>
+    </div>
+    <script>
+        function showResult(html, color) { const el=document.getElementById('result'); el.style.display='block'; el.innerHTML=html; el.style.color=color; }
+        function collect() {
+            const data={};
+            document.querySelectorAll('[data-setting]').forEach(el=>{
+                const k=el.dataset.setting, t=el.dataset.type;
+                if(t==='bool') data[k]=el.checked;
+                else if(t==='int') data[k]=parseInt(el.value)||0;
+                else if(t==='list') data[k]=el.value.split(/[,\s]+/).filter(x=>x);
+                else data[k]=el.value;
+            });
+            return data;
+        }
+        function saveAll() {
+            fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(collect())})
+              .then(r=>r.json()).then(()=>{showResult('✅ Settings saved.','#4ade80');setTimeout(()=>location.reload(),600);});
+        }
+        function resetSection(s) {
+            if(!confirm('Reset this section to defaults?'))return;
+            fetch('/api/settings/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({section:s})}).then(()=>location.reload());
+        }
+        function resetPincodes() {
+            if(!confirm('Clear rejected pincodes?'))return;
+            fetch('/api/pincodes/reset',{method:'POST'}).then(r=>r.json()).then(d=>showResult('✅ Cleared ('+d.rejected+' left).','#4ade80'));
+        }
+        function resetDeviceMarks() {
+            if(!confirm('Clear used devices and used numbers?'))return;
+            fetch('/api/device-marks/reset',{method:'POST'}).then(r=>r.json()).then(d=>showResult('✅ Cleared devices and used numbers.','#4ade80'));
+        }
+        function testProxy() {
+            const p=document.querySelector('[data-setting="proxy"]').value.trim();
+            if(!p){showResult('⚠️ Enter a proxy first.','#facc15');return;}
+            showResult('⏳ Testing...','#94a3b8');
+            fetch('/api/test_proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy:p})}).then(r=>r.json()).then(d=>{
+                showResult(d.status==='success'?'✅ Proxy OK — '+d.ip+' ('+d.country+')':'❌ '+d.message, d.status==='success'?'#4ade80':'#f87171');
+            });
+        }
+        function testSolver() {
+            showResult('⏳ Solving one token...','#94a3b8');
+            fetch('/api/test_solver',{method:'POST'}).then(r=>r.json()).then(d=>{
+                showResult(d.status==='success'?'✅ Provider: '+d.provider+', len: '+d.token_len:'❌ '+d.message, d.status==='success'?'#4ade80':'#f87171');
+            });
+        }
+        function testNocaptcha() {
+            const k=document.querySelector('[data-setting="nocaptcha_key"]').value.trim();
+            showResult('⏳ Checking balance...','#94a3b8');
+            fetch('/api/nocaptcha/balance',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k})}).then(r=>r.json()).then(d=>{
+                showResult(d.status==='success'?'✅ Balance $'+d.balance+' daily '+d.daily_used+'/'+d.daily_limit:'❌ '+d.message, d.status==='success'?'#4ade80':'#f87171');
+            });
+        }
+    </script>
+</body>
+</html>
