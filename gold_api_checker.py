@@ -31,7 +31,9 @@ import requests
 import urllib3
 from flask import Flask, render_template, request, jsonify, redirect, url_for
 
-urllib3.disable_warnings()
+# MITM proxies (e.g. ScraperAPI) re-sign TLS with an untrusted CA. Our own
+# verify=False calls are intentional; suppress only the noisy warning.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -166,6 +168,7 @@ REJECTED_PINCODES_FILE = data_path("rejected_pincodes.json")
 DEFAULTS = {
     # proxy
     "proxy": "",
+    "ssl_verify": True,
     # solver
     "solver_mode": "auto",
     "nocaptcha_key": "",
@@ -194,7 +197,7 @@ DEFAULTS = {
     "tg_chat_id": TG_CHAT_ID,
 }
 SECTIONS = {
-    "proxy": ["proxy"],
+    "proxy": ["proxy", "ssl_verify"],
     "solver": ["solver_mode", "nocaptcha_key", "sursolver_keys", "twocaptcha_key",
                "token_budget", "network_retries"],
     "device": ["bigcity_daily_limit", "bigcity_sms_pattern", "mark_devices",
@@ -1005,6 +1008,7 @@ def gold_session(proxies=None):
     s = requests.Session()
     if proxies:
         s.proxies.update(proxies)
+    s.verify = get_setting("ssl_verify", bool)
     s.headers.update({
         "user-agent": UA,
         "accept": "application/json",
@@ -1363,6 +1367,7 @@ def zomato_send_otp(phone, proxies=None):
 
     try:
         session = requests.Session()
+        session.verify = get_setting("ssl_verify", bool)
         session.headers.update({
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                           "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -1546,6 +1551,7 @@ def instamart_send_otp(phone, proxies=None):
     s = requests.Session()
     if proxies:
         s.proxies.update(proxies)
+    s.verify = get_setting("ssl_verify", bool)
     try:
         for url, matcher in ((INSTAMART_SIGNIN_URL, INSTAMART_MATCHERS["signin"]),
                              (INSTAMART_SEND_URL, INSTAMART_MATCHERS["send"])):

@@ -55,6 +55,11 @@
             <div class="form-group">
                 <label>HTTP Proxy (Zomato & Gold Drop API)</label>
                 <input type="text" data-setting="proxy" value="{{ settings.proxy or '' }}" placeholder="http://user:pass@host:port">
+                <div class="check" style="padding-top:12px;">
+                    <input type="checkbox" data-setting="ssl_verify" data-type="bool" id="ssl_verify" {% if settings.ssl_verify %}checked{% endif %}>
+                    <label for="ssl_verify">Verify TLS certificates (turn OFF for MITM proxies like ScraperAPI)</label>
+                </div>
+                <small>When off, Zomato, Instamart and Gold Drop API calls skip certificate checks. Firebase and solver APIs stay verified.</small>
             </div>
         </div>
 
