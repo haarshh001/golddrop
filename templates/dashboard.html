@@ -95,6 +95,18 @@
                 <h3>🏆 Hits (Wins)</h3>
                 <div class="value green">{{ hit_count }}</div>
             </div>
+            <div class="stat-card">
+                <h3>🔁 Tries today</h3>
+                <div class="value blue">{{ stats.tries }}</div>
+            </div>
+            <div class="stat-card">
+                <h3>✅ Wins today</h3>
+                <div class="value green">{{ stats.wins }}</div>
+            </div>
+            <div class="stat-card">
+                <h3>➖ No reward today</h3>
+                <div class="value yellow">{{ stats.none }}</div>
+            </div>
         </div>
 
         <div class="grid-layout">

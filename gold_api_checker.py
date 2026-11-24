@@ -162,6 +162,7 @@ BIGCITY_DAILY_LIMIT = int(os.environ.get("BIGCITY_DAILY_LIMIT", "5")
 # them for the rest of that day. A new calendar date makes them eligible again.
 DEVICE_MARKS_FILE = data_path("device_day_marks.json")
 REJECTED_PINCODES_FILE = data_path("rejected_pincodes.json")
+STATS_FILE = data_path("daily_stats.json")
 
 # Default values for every dashboard-editable setting, grouped by section.
 # The Settings page reads these and /api/settings/reset restores one section.
@@ -511,6 +512,62 @@ def load_hits():
 def today_key():
     """IST calendar date as YYYY-MM-DD; the rollover point is 00:00 IST."""
     return datetime.now(IST).strftime("%Y-%m-%d")
+
+
+STATS_LOCK = threading.Lock()
+
+
+def load_stats():
+    """Return the whole stats dict from the volume. Caller holds STATS_LOCK."""
+    try:
+        if os.path.exists(STATS_FILE):
+            with open(STATS_FILE, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def today_stats():
+    """Tries/wins/none for today; a new IST date starts at zero automatically."""
+    data = load_stats()
+    return data.get(today_key(), {"tries": 0, "wins": 0, "none": 0})
+
+
+def record_attempt(outcome=None):
+    """Count one registration attempt. outcome: 'win' or 'none'."""
+    with STATS_LOCK:
+        data = load_stats()
+        key = today_key()
+        entry = data.setdefault(key, {"tries": 0, "wins": 0, "none": 0})
+        entry["tries"] = int(entry.get("tries", 0)) + 1
+        if outcome == "win":
+            entry["wins"] = int(entry.get("wins", 0)) + 1
+        elif outcome == "none":
+            entry["none"] = int(entry.get("none", 0)) + 1
+        for old in sorted(data.keys())[:-7]:
+            data.pop(old, None)
+        try:
+            with open(STATS_FILE, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2)
+        except Exception as exc:
+            log("stats save error: %s" % exc, "ERROR")
+
+
+def record_outcome(outcome):
+    """Increment wins/none for an already-counted attempt."""
+    with STATS_LOCK:
+        data = load_stats()
+        entry = data.setdefault(today_key(), {"tries": 0, "wins": 0, "none": 0})
+        if outcome in ("win", "none"):
+            entry[outcome] = int(entry.get(outcome, 0)) + 1
+        try:
+            with open(STATS_FILE, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2)
+        except Exception:
+            pass
 
 
 def load_device_marks():
@@ -1745,6 +1802,7 @@ def firebase_worker(instance_id, start_idx, end_idx):
                             # attempt is never mistaken for the current one.
                             baseline = get_last_message_key(db_url, device_id)
                             log("    [*] Attempt %d/%d for %s" % (attempt, attempts_per_number, phone))
+                            record_attempt()
 
                             # Retry transport failures in place so a proxy timeout
                             # does not consume an attempt. Only before the token stage —
@@ -1775,10 +1833,12 @@ def firebase_worker(instance_id, start_idx, end_idx):
                             if ok:
                                 decoded = result["decoded"]
                                 if classify_win(decoded):
+                                    record_outcome("win")
                                     log("    [%s] WIN win_type=%s" % (phone, decoded.get("win_type")), "WIN")
                                     report_win(decoded, phone, device_id, db_url, result, baseline)
                                     break  # no further attempts needed after a win
                                 else:
+                                    record_outcome("none")
                                     log("    [%s] No reward (win_type=%s)"
                                         % (phone, decoded.get("win_type")), "NOREWARD")
                             else:
@@ -1978,7 +2038,31 @@ def dry_run():
     assert is_used_today_error(otp_limit_error), "daily OTP-limit error not classified as used-today"
     assert not is_used_today_error("BigCity OTP not received in time")
     assert get_setting("attempts_per_number", int) == 3, "attempts per number should be 3"
-    log("Used-today detection: participation + OTP-limit matched; attempts default 3")
+
+    # Daily stats reset at IST midnight.
+    old_stats_file = STATS_FILE
+    import tempfile
+    tmpd = tempfile.mkdtemp(prefix="gd-stats-")
+    try:
+        globals()["STATS_FILE"] = os.path.join(tmpd, "daily_stats.json")
+        before = today_stats()
+        assert before.get("tries", 0) == 0, "fresh day should start at zero"
+        record_attempt()
+        record_outcome("none")
+        record_attempt("win")
+        s = today_stats()
+        assert s["tries"] == 2 and s["none"] == 1 and s["wins"] == 1, s
+        globals()["STATS_FILE"] = os.path.join(tmpd, "tomorrow_stats.json")
+        nxt = today_stats()
+        assert nxt.get("tries", 0) == 0, "stats did not reset on a new date"
+    finally:
+        globals()["STATS_FILE"] = old_stats_file
+        try:
+            import shutil
+            shutil.rmtree(tmpd, ignore_errors=True)
+        except Exception:
+            pass
+    log("Daily stats: tries/wins/none counted and reset at midnight")
 
     # Device day-marker: date key, today-only skip, midnight rollover.
     assert re.match(r"^\d{4}-\d{2}-\d{2}$", today_key()), "today_key format wrong"
@@ -2150,6 +2234,7 @@ def manual_verify(sid, otp):
         "full_response": decoded,
         "phone": entry["phone"],
     }
+    record_attempt("win" if result["win"] else "none")
     if result["win"]:
         hit = {
             "campaign": "gold-drop-manual",
@@ -2237,6 +2322,7 @@ def dashboard():
         log_count=len(logs),
         hit_count=len(hits),
         link_count=len(load_firebase_links()),
+        stats=today_stats(),
     )
 
 
