@@ -1,70 +1,78 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <title>Gold Drop Checker - Firebase Links</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #0f172a; color: #e2e8f0; }
-        .navbar { background: #1e293b; padding: 16px 24px; display: flex; align-items: center; gap: 24px; border-bottom: 1px solid #334155; }
-        .navbar h1 { font-size: 20px; color: #38bdf8; }
-        .navbar a { color: #94a3b8; text-decoration: none; padding: 6px 12px; border-radius: 6px; transition: all 0.2s; }
-        .navbar a:hover, .navbar a.active { color: #e2e8f0; background: #334155; }
-        .container { max-width: 1200px; margin: 24px auto; padding: 0 24px; }
-        textarea { width: 100%; height: 400px; background: #1e293b; color: #e2e8f0; border: 1px solid #334155; border-radius: 12px; padding: 16px; font-family: 'Cascadia Code', monospace; font-size: 13px; resize: vertical; }
-        textarea:focus { outline: none; border-color: #38bdf8; }
-        .btn { padding: 10px 24px; border-radius: 8px; border: none; font-size: 14px; font-weight: 600; cursor: pointer; background: #38bdf8; color: #0f172a; margin-top: 12px; }
-        .btn:hover { background: #0ea5e9; }
-        .info { color: #94a3b8; margin-bottom: 12px; font-size: 14px; }
-        .single-add { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; }
-        .single-add input { flex: 1; padding: 10px 14px; background: #1e293b; color: #e2e8f0; border: 1px solid #334155; border-radius: 8px; font-size: 14px; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Toing Firebase Links</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',Tahoma,sans-serif;background:#0f172a;color:#e2e8f0}
+.navbar{background:#1e293b;padding:16px 24px;display:flex;gap:24px;align-items:center;border-bottom:1px solid #334155}
+.navbar h1{font-size:20px;color:#38bdf8}
+.navbar a{color:#94a3b8;text-decoration:none;padding:6px 12px;border-radius:6px}
+.navbar a.active{color:#e2e8f0;background:#334155}
+.container{max-width:1100px;margin:24px auto;padding:0 24px}
+textarea{width:100%;height:420px;background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:12px;padding:16px;font-family:monospace;font-size:13px;resize:vertical}
+input{padding:10px 12px;background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:8px;font-size:14px}
+.btn{padding:10px 20px;border:none;border-radius:8px;background:#38bdf8;color:#0f172a;font-weight:700;cursor:pointer;margin-top:12px}
+.btn-red{background:#ef4444;color:#fff}
+.row{display:flex;gap:10px;align-items:center;margin-bottom:12px}
+.row input{flex:1}
+.info{color:#94a3b8;font-size:14px;margin-bottom:12px}
+ul{list-style:none}li{padding:6px 0;border-bottom:1px solid #334155;font-size:13px;display:flex;justify-content:space-between}
+li button{background:#ef4444;color:#fff;border:none;border-radius:6px;padding:3px 10px;cursor:pointer}
+@media(max-width:760px){
+  .navbar{padding:12px 14px;flex-wrap:wrap;gap:4px}
+  .navbar h1,.brand{width:100%;margin-bottom:4px}
+  .navbar a{padding:7px 9px;font-size:11px}
+  .container,.wrap{padding:18px 14px;margin:12px auto}
+  .box{height:70vh;font-size:11px;padding:10px}
+  .grid,.grid2,.stats{grid-template-columns:1fr!important}
+  .controls{grid-template-columns:1fr 1fr!important}
+  table{font-size:11px;display:block;overflow-x:auto}
+  th,td{padding:7px 6px}
+  .hit{padding:14px}
+  .actions,.btn-group{gap:6px}
+  .btn{padding:8px 10px;font-size:11px}
+  input,textarea{width:100%!important;font-size:14px}
+  .head,.page-head{flex-direction:column;align-items:flex-start;gap:10px}
+}</style>
 </head>
 <body>
-    <nav class="navbar">
-        <h1>🎯 Gold Drop Checker</h1>
-        <a href="/">Dashboard</a>
-        <a href="/logs">Logs</a>
-        <a href="/hits">Hits</a>
-        <a href="/firebases" class="active">Firebase</a>
-        <a href="/manual">Manual</a>
-        <a href="/settings">Settings</a>
-    </nav>
-    <div class="container">
-        <h2 style="margin-bottom:8px;">Firebase Links ({{ links|length }})</h2>
-        <p class="info">One Firebase URL per line. Plain URLs and Nexus "URL:" export blocks both work. Existing links are preserved when you add one.</p>
-        <div class="single-add">
-            <input type="text" id="single" placeholder="https://...firebaseio.com">
-            <button class="btn" style="margin-top:0;" onclick="addOne()">➕ Add one</button>
-        </div>
-        <textarea id="links">{% for idx, link in links %}{{ link }}
+<nav class="navbar"><h1>🎯 Toing Dashboard</h1>
+<a href="/">Dashboard</a><a href="/logs">Logs</a><a href="/hits">Hits</a>
+<a href="/manual">Manual</a>
+  <a href="/firebases" class="active">Firebase</a><a href="/settings">Settings</a></nav>
+<div class="container">
+<h2 style="margin-bottom:8px">Firebase Links ({{ links|length }})</h2>
+<p class="info">Stored in the Railway volume. Add one, remove one, or save the full list. Plain URLs and Nexus "URL:" blocks both work.</p>
+<div class="row"><input type="text" id="one" placeholder="https://...firebaseio.com">
+<button class="btn" style="margin:0" onclick="addOne()">➕ Add one</button></div>
+<textarea id="links">{% for idx, link in links %}{{ link }}
 {% endfor %}</textarea>
-        <button class="btn" onclick="saveLinks()">💾 Save All Links</button>
-    </div>
-    <script>
-        function saveLinks() {
-            const links = document.getElementById('links').value;
-            fetch('/api/update-links', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({links})
-            }).then(r=>r.json()).then(d=>{
-                alert('Saved ' + d.count + ' links.');
-                location.reload();
-            });
-        }
-        function addOne() {
-            const url = document.getElementById('single').value.trim();
-            if (!url) { alert('Enter a URL first.'); return; }
-            fetch('/api/add-link', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({url})
-            }).then(r=>r.json()).then(d=>{
-                if (d.status === 'success') { alert('Added. Total: ' + d.count); location.reload(); }
-                else alert(d.message);
-            });
-        }
-    </script>
+<button class="btn" onclick="saveAll()">💾 Save All Links</button>
+<div style="margin-top:24px"><h3 style="color:#38bdf8;margin-bottom:10px">Current list</h3><ul id="lst"></ul></div>
+</div>
+<script>
+function loadList(){
+  fetch('/firebases').then(r=>r.text()).then(()=>{
+    const ta=document.getElementById('links').value.split('\n').map(x=>x.trim()).filter(Boolean);
+    document.getElementById('lst').innerHTML=ta.map(u=>'<li><span>'+u+'</span><button onclick="removeOne(this.dataset.u)" data-u="'+u+'">✕</button></li>').join('');
+  });
+}
+function addOne(){
+  const u=document.getElementById('one').value.trim();
+  if(!u)return;
+  fetch('/api/links/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:u})}).then(()=>location.reload());
+}
+function removeOne(u){
+  if(!confirm('Remove '+u+'?'))return;
+  fetch('/api/links/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:u})}).then(()=>location.reload());
+}
+function saveAll(){
+  fetch('/api/links/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({links:document.getElementById('links').value})})
+   .then(r=>r.json()).then(d=>{alert('Saved '+d.count+' links');location.reload();});
+}
+loadList();
+</script>
 </body>
 </html>

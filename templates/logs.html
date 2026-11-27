@@ -1,56 +1,56 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <title>Gold Drop Checker - Logs</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #0f172a; color: #e2e8f0; }
-        .navbar { background: #1e293b; padding: 16px 24px; display: flex; align-items: center; gap: 24px; border-bottom: 1px solid #334155; }
-        .navbar h1 { font-size: 20px; color: #38bdf8; }
-        .navbar a { color: #94a3b8; text-decoration: none; padding: 6px 12px; border-radius: 6px; transition: all 0.2s; }
-        .navbar a:hover, .navbar a.active { color: #e2e8f0; background: #334155; }
-        .container { max-width: 1200px; margin: 24px auto; padding: 0 24px; }
-        .log-box { background: #1e293b; border-radius: 12px; padding: 16px; border: 1px solid #334155; font-family: 'Cascadia Code', monospace; font-size: 13px; max-height: 80vh; overflow-y: auto; }
-        .log-box div { padding: 2px 0; white-space: pre-wrap; word-break: break-all; }
-        .WIN { color: #22c55e; font-weight: bold; }
-        .NOREWARD { color: #fbbf24; }
-        .HIT { color: #38bdf8; font-weight: bold; }
-        .ERROR { color: #f87171; }
-        .INFO { color: #94a3b8; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Toing Logs</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',Tahoma,sans-serif;background:#0f172a;color:#e2e8f0}
+.navbar{background:#1e293b;padding:16px 24px;display:flex;gap:24px;align-items:center;border-bottom:1px solid #334155}
+.navbar h1{font-size:20px;color:#38bdf8}
+.navbar a{color:#94a3b8;text-decoration:none;padding:6px 12px;border-radius:6px}
+.navbar a.active{color:#e2e8f0;background:#334155}
+.container{max-width:1200px;margin:24px auto;padding:0 24px}
+.box{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:16px;height:80vh;overflow:auto;font-family:monospace;font-size:13px;white-space:pre-wrap}
+.WIN{color:#4ade80;font-weight:bold}.NOREWARD{color:#fbbf24}.HIT{color:#38bdf8}
+.SKIP{color:#c084fc}.ERROR{color:#f87171}.OTPFAIL{color:#f87171}.OTP{color:#38bdf8}.INFO{color:#94a3b8}
+@media(max-width:760px){
+  .navbar{padding:12px 14px;flex-wrap:wrap;gap:4px}
+  .navbar h1,.brand{width:100%;margin-bottom:4px}
+  .navbar a{padding:7px 9px;font-size:11px}
+  .container,.wrap{padding:18px 14px;margin:12px auto}
+  .box{height:70vh;font-size:11px;padding:10px}
+  .grid,.grid2,.stats{grid-template-columns:1fr!important}
+  .controls{grid-template-columns:1fr 1fr!important}
+  table{font-size:11px;display:block;overflow-x:auto}
+  th,td{padding:7px 6px}
+  .hit{padding:14px}
+  .actions,.btn-group{gap:6px}
+  .btn{padding:8px 10px;font-size:11px}
+  input,textarea{width:100%!important;font-size:14px}
+  .head,.page-head{flex-direction:column;align-items:flex-start;gap:10px}
+}</style>
 </head>
 <body>
-    <nav class="navbar">
-        <h1>🎯 Gold Drop Checker</h1>
-        <a href="/">Dashboard</a>
-        <a href="/logs" class="active">Logs</a>
-        <a href="/hits">Hits</a>
-        <a href="/firebases">Firebase</a>
-        <a href="/manual">Manual</a>
-        <a href="/settings">Settings</a>
-    </nav>
-    <div class="container">
-        <h2 style="margin-bottom:16px;">Logs (auto-refresh)</h2>
-        <div class="log-box" id="logbox"></div>
-    </div>
-    <script>
-        function refreshLogs() {
-            fetch('/api/logs').then(r=>r.json()).then(logs=>{
-                const box = document.getElementById('logbox');
-                box.innerHTML = logs.reverse().map(l => {
-                    let cls = 'INFO';
-                    if (l.includes('[ERROR]')) cls = 'ERROR';
-                    else if (l.includes('[WIN]')) cls = 'WIN';
-                    else if (l.includes('[NOREWARD]')) cls = 'NOREWARD';
-                    else if (l.includes('[HIT]')) cls = 'HIT';
-                    const safe = l.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-                    return `<div class="${cls}">${safe}</div>`;
-                }).join('');
-            });
-        }
-        refreshLogs();
-        setInterval(refreshLogs, 2000);
-    </script>
+<nav class="navbar"><h1>🎯 Toing Dashboard</h1>
+<a href="/">Dashboard</a><a href="/logs" class="active">Logs</a><a href="/hits">Hits</a>
+<a href="/manual">Manual</a>
+  <a href="/firebases">Firebase</a><a href="/settings">Settings</a></nav>
+<div class="container"><h2 style="margin-bottom:16px">Logs (auto-refresh)</h2><div class="box" id="box"></div></div>
+<script>
+function refresh(){fetch('/api/logs').then(r=>r.json()).then(logs=>{
+  document.getElementById('box').innerHTML=logs.reverse().map(l=>{
+    let c='INFO';
+    if(l.includes('[OTPFAIL]')||l.includes('[ERROR]'))c='ERROR';
+    else if(l.includes('[WIN]'))c='WIN';
+    else if(l.includes('[ALREADY]')||l.includes('[NOREWARD]'))c='NOREWARD';
+    else if(l.includes('[SKIP]'))c='SKIP';
+    else if(l.includes('[OTP]')||l.includes('[HIT]'))c='HIT';
+    const s=l.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    return '<div class="'+c+'">'+s+'</div>';
+  }).join('');
+});}
+refresh();setInterval(refresh,2000);
+</script>
 </body>
 </html>
